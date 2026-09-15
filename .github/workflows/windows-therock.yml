@@ -20,7 +20,6 @@ env:
   ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
   THEROCK_REPO: zz002/TheRock
   THEROCK_REF: feat/gfx117x-mds-support
-  SCCACHE_DIR: C:\temp\sccache
   SCCACHE_CACHE_SIZE: 20G
 
 jobs:
@@ -93,10 +92,13 @@ jobs:
             exit 1
           }
           Write-Host "using $($sccache.Source)"
-          New-Item -ItemType Directory -Force -Path $env:SCCACHE_DIR | Out-Null
+          $dir = Join-Path $env:USERPROFILE "sccache"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $env:SCCACHE_DIR = $dir
+          "SCCACHE_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           sccache --stop-server 2>&1 | Out-Null
           sccache --start-server
-          Write-Host "SCCACHE_DIR=$env:SCCACHE_DIR"
+          Write-Host "SCCACHE_DIR=$dir"
           sccache --show-stats
 
       - name: Initialize TheRock Python environment
