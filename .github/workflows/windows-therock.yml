@@ -20,6 +20,8 @@ env:
   ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
   THEROCK_REPO: zz002/TheRock
   THEROCK_REF: feat/gfx117x-mds-support
+  SCCACHE_DIR: C:\temp\sccache
+  SCCACHE_CACHE_SIZE: 20G
 
 jobs:
   therock:
@@ -82,15 +84,6 @@ jobs:
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
 
-      - name: Prepare sccache directory
-        shell: powershell
-        run: |
-          $dir = Join-Path $env:USERPROFILE "sccache"
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          "SCCACHE_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "SCCACHE_CACHE_SIZE=20G" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "SCCACHE_DIR=$dir"
-
       - name: Start sccache
         shell: powershell
         run: |
@@ -100,6 +93,10 @@ jobs:
             exit 1
           }
           Write-Host "using $($sccache.Source)"
+          New-Item -ItemType Directory -Force -Path $env:SCCACHE_DIR | Out-Null
+          sccache --stop-server 2>&1 | Out-Null
+          sccache --start-server
+          Write-Host "SCCACHE_DIR=$env:SCCACHE_DIR"
           sccache --show-stats
 
       - name: Initialize TheRock Python environment
