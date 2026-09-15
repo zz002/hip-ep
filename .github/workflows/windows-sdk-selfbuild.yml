@@ -119,6 +119,8 @@ jobs:
           $helper = Join-Path $env:SB_ROOT "helpers.ps1"
           @'
           function Invoke-Checked {
+            # curl progress, cmake warnings and git fetch all use stderr.
+            $ErrorActionPreference = 'Continue'
             $exe = $args[0]
             $rest = @()
             if ($args.Length -gt 1) { $rest = $args[1..($args.Length - 1)] }
@@ -128,6 +130,10 @@ jobs:
           function Convert-Fwd([string]$p) { return ($p -replace '\\', '/') }
           function Ensure-PinnedRepo {
             param([string]$Url, [string]$Dir, [string]$Pin)
+            # git writes progress and "unknown revision HEAD" to stderr, which
+            # the runner's ErrorActionPreference=Stop turns into a terminating
+            # error. Gate on $LASTEXITCODE instead.
+            $ErrorActionPreference = 'Continue'
             if (-not (Test-Path (Join-Path $Dir '.git'))) {
               New-Item -ItemType Directory -Force -Path $Dir | Out-Null
               git -C $Dir init
@@ -135,8 +141,8 @@ jobs:
               git -C $Dir remote add origin $Url
               if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             }
-            $head = git -C $Dir rev-parse HEAD 2>$null
-            if ($head -eq $Pin) {
+            $head = git -C $Dir rev-parse --verify --quiet HEAD
+            if ($LASTEXITCODE -eq 0 -and $head -eq $Pin) {
               Write-Host "already at $Pin : $Dir"
               return
             }
