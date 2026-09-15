@@ -15,6 +15,8 @@ on:
         required: false
         type: string
         default: "1"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -48,7 +50,8 @@ jobs:
         shell: powershell
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: "8"
-      FROM_STEP: ${{ inputs.from_step }}
+      # pull_request carries no inputs, so every step gate reads this instead.
+      FROM_STEP: ${{ inputs.from_step || '1' }}
 
     steps:
       - name: Configure git for long paths
@@ -194,6 +197,7 @@ jobs:
               "-DCMAKE_LINKER=link.exe" `
               "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" `
               "-DZLIB_BUILD_SHARED=OFF" `
+              "-DZLIB_BUILD_TESTING=OFF" `
               "-DCMAKE_C_COMPILER_LAUNCHER=sccache" `
               "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
             Invoke-Checked cmake --build $zb
@@ -233,7 +237,7 @@ jobs:
           }
 
       - name: Pull PAL libs with dvc
-        if: ${{ success() && fromJSON(inputs.from_step) <= 5 }}
+        if: ${{ success() && fromJSON(env.FROM_STEP) <= 5 }}
         timeout-minutes: 30
         run: |
           $sys = Join-Path $env:SB_SRC "rocm-systems"
@@ -279,7 +283,7 @@ jobs:
           }
 
       - name: 1. Build llvm (clang + lld)
-        if: ${{ success() && fromJSON(inputs.from_step) <= 1 }}
+        if: ${{ success() && fromJSON(env.FROM_STEP) <= 1 }}
         timeout-minutes: 240
         run: |
           . (Join-Path $env:SB_ROOT "helpers.ps1")
@@ -346,7 +350,7 @@ jobs:
           }
 
       - name: 2. Build hipcc
-        if: ${{ success() && fromJSON(inputs.from_step) <= 2 }}
+        if: ${{ success() && fromJSON(env.FROM_STEP) <= 2 }}
         run: |
           . (Join-Path $env:SB_ROOT "helpers.ps1")
           $src = Join-Path $env:SB_SRC "llvm-project\amd\hipcc"
@@ -366,7 +370,7 @@ jobs:
           Invoke-Checked cmake --install $b
 
       - name: 3. Build AMDDeviceLibs
-        if: ${{ success() && fromJSON(inputs.from_step) <= 3 }}
+        if: ${{ success() && fromJSON(env.FROM_STEP) <= 3 }}
         run: |
           . (Join-Path $env:SB_ROOT "helpers.ps1")
           $src = Join-Path $env:SB_SRC "llvm-project\amd\device-libs"
@@ -382,7 +386,7 @@ jobs:
           Invoke-Checked cmake --install $b
 
       - name: 4. Build amd-comgr
-        if: ${{ success() && fromJSON(inputs.from_step) <= 4 }}
+        if: ${{ success() && fromJSON(env.FROM_STEP) <= 4 }}
         timeout-minutes: 120
         run: |
           . (Join-Path $env:SB_ROOT "helpers.ps1")
@@ -413,7 +417,7 @@ jobs:
           Invoke-Checked cmake --install $b
 
       - name: 5. Build hip-clr
-        if: ${{ success() && fromJSON(inputs.from_step) <= 5 }}
+        if: ${{ success() && fromJSON(env.FROM_STEP) <= 5 }}
         timeout-minutes: 90
         run: |
           . (Join-Path $env:SB_ROOT "helpers.ps1")
@@ -458,7 +462,7 @@ jobs:
           }
 
       - name: 6. Build hipBLASLt
-        if: ${{ success() && fromJSON(inputs.from_step) <= 6 }}
+        if: ${{ success() && fromJSON(env.FROM_STEP) <= 6 }}
         timeout-minutes: 180
         run: |
           . (Join-Path $env:SB_ROOT "helpers.ps1")
