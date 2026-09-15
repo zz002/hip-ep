@@ -1,0 +1,178 @@
+##
+## Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+## Licensed under the MIT License.
+##
+name: Windows TheRock
+
+# Fork-only TheRock SDK source build on the strix_build self-hosted runner.
+# Clones zz002/TheRock@feat/gfx117x-mds-support with the runner's local gh
+# login (GITHUB_TOKEN is unset so gh does not pick up the job token).
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
+  THEROCK_REPO: zz002/TheRock
+  THEROCK_REF: feat/gfx117x-mds-support
+
+jobs:
+  therock:
+    if: github.repository == 'zz002/hip-ep'
+    runs-on: strix_build
+    timeout-minutes: 600
+    concurrency:
+      group: deps-therock-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Configure git for TheRock sources
+        shell: pwsh
+        run: |
+          git config --global core.symlinks true
+          git config --global core.longpaths true
+
+      - name: Clean leftover TheRock trees
+        shell: pwsh
+        run: |
+          $dst = Join-Path "${{ github.workspace }}" "source-therock"
+          if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+          $pfx = Join-Path "${{ runner.workspace }}" "therock-prefix"
+          if (Test-Path $pfx) { Remove-Item -Recurse -Force $pfx }
+
+      - name: Clone TheRock with local gh
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          gh auth setup-git
+          gh auth status
+          gh repo clone ${{ env.THEROCK_REPO }} source-therock -- --branch ${{ env.THEROCK_REF }} --depth 1
+
+      - name: Record TheRock revision
+        id: key
+        shell: pwsh
+        working-directory: source-therock
+        run: |
+          $short = git rev-parse --short=12 HEAD
+          "value=windows-therock-$short-gfx117x" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "cache/artifact key: windows-therock-$short-gfx117x"
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      - name: Initialize TheRock Python environment
+        shell: pwsh
+        working-directory: source-therock
+        run: |
+          py -3.12 -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+          "${{ github.workspace }}\source-therock\.venv\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Prepare TheRock sources
+        timeout-minutes: 60
+        shell: pwsh
+        working-directory: source-therock
+        run: |
+          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          gh auth setup-git
+          .\.venv\Scripts\python.exe .\build_tools\fetch_sources.py --dvc-projects rocm-systems
+
+      - name: Build TheRock SDK
+        shell: cmd
+        working-directory: source-therock
+        run: build.bat
+
+      - name: Verify and stage TheRock SDK
+        shell: pwsh
+        working-directory: source-therock
+        run: |
+          $dist = (Resolve-Path .\build\dist\rocm).Path
+          $required = @(
+            "lib\llvm\bin\clang.exe",
+            "lib\llvm\bin\lld.exe",
+            "lib\llvm\bin\clang-offload-bundler.exe",
+            "lib\llvm\amdgcn\bitcode",
+            "bin\hipcc.bat",
+            "bin\hipblaslt.dll",
+            "lib\cmake\hip\hip-config.cmake",
+            "lib\cmake\hip-lang\hip-lang-config.cmake",
+            "lib\cmake\hipblaslt",
+            "lib\cmake\AMDDeviceLibs",
+            "lib\cmake\amd_comgr"
+          )
+          $missing = $required | Where-Object { -not (Test-Path (Join-Path $dist $_)) }
+          if (-not (Get-ChildItem "$dist\bin\amdhip64*.dll" -ErrorAction SilentlyContinue)) {
+            $missing += "bin\amdhip64*.dll"
+          }
+          if (-not (Get-ChildItem "$dist\bin\amd_comgr*.dll" -ErrorAction SilentlyContinue)) {
+            $missing += "bin\amd_comgr*.dll"
+          }
+          if (-not (Get-ChildItem "$dist\bin\hiprtc*.dll" -ErrorAction SilentlyContinue)) {
+            $missing += "bin\hiprtc*.dll"
+          }
+          if (-not (Get-ChildItem "$dist\bin\hipblaslt\library" -Directory -ErrorAction SilentlyContinue)) {
+            $missing += "bin\hipblaslt\library"
+          }
+          if ($missing) {
+            $missing | ForEach-Object { Write-Host "MISSING: $_" }
+            exit 1
+          }
+
+          $before = [math]::Round((Get-ChildItem $dist -Recurse -File | Measure-Object Length -Sum).Sum / 1GB, 2)
+          $keepExe = @(
+            "clang.exe", "clang++.exe", "lld.exe", "lld-link.exe",
+            "llvm-objcopy.exe", "clang-offload-bundler.exe", "amdgpu-arch.exe"
+          )
+          Get-ChildItem "$dist\lib\llvm\bin" -File |
+            Where-Object { $keepExe -notcontains $_.Name } | Remove-Item -Force
+          $keepBinDll = @(
+            "amd_comgr0714.dll", "amdhip64_7.dll", "hipblaslt.dll",
+            "hiprtc0714.dll", "hiprtc-builtins0714.dll"
+          )
+          Get-ChildItem "$dist\bin" -Filter *.dll |
+            Where-Object { $keepBinDll -notcontains $_.Name } | Remove-Item -Force
+          Get-ChildItem "$dist\lib" -Filter *.lib -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch '^(amd_comgr|amdhip64|hipblaslt|hiprtc)' } |
+            Remove-Item -Force
+          $dropCmake = @(
+            "rocblas", "rocrand", "rocm-core", "rocm-kpack", "hipblas",
+            "hiprand", "fftw3", "fftw3f", "flatbuffers", "mxDataGenerator",
+            "composable_kernel"
+          )
+          foreach ($c in $dropCmake) { Remove-Item "$dist\lib\cmake\$c" -Recurse -Force -ErrorAction SilentlyContinue }
+          $dropInc = @(
+            "ck", "ck_tile", "half", "rapidjson", "nlohmann", "flatbuffers",
+            "rocblas", "rocrand", "rocm-core", "rocm_kpack", "hipblas",
+            "hiprand", "mxDataGenerator", "hsakmt"
+          )
+          foreach ($i in $dropInc) { Remove-Item "$dist\include\$i" -Recurse -Force -ErrorAction SilentlyContinue }
+          Remove-Item "$dist\lib\llvm\include" -Recurse -Force -ErrorAction SilentlyContinue
+          Get-ChildItem "$dist\lib\llvm\lib" -File -Filter *.lib -ErrorAction SilentlyContinue | Remove-Item -Force
+          Remove-Item "$dist\.info", "$dist\.kpack", "$dist\libexec" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "$dist\bin\rocblas" -Recurse -Force -ErrorAction SilentlyContinue
+          $after = [math]::Round((Get-ChildItem $dist -Recurse -File | Measure-Object Length -Sum).Sum / 1GB, 2)
+          Write-Host "dist trimmed: ${before} GB -> ${after} GB"
+
+          $prefix = "${{ runner.workspace }}\therock-prefix"
+          robocopy $dist $prefix /MIR /NFL /NDL /NJH /NJS /NP
+          if ($LASTEXITCODE -ge 8) {
+            exit $LASTEXITCODE
+          }
+          Get-ChildItem "$prefix\bin\hipblaslt\library" -Directory |
+            ForEach-Object { Write-Host "hipBLASLt logic: $($_.Name)" }
+          exit 0
+
+      - name: Upload TheRock SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.key.outputs.value }}
+          path: ${{ runner.workspace }}/therock-prefix
+          retention-days: 7
