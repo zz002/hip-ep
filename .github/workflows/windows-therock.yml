@@ -102,6 +102,44 @@ jobs:
           gh auth setup-git
           .\.venv\Scripts\python.exe .\build_tools\fetch_sources.py --dvc-projects none
 
+      - name: Pull PAL libs with dvc
+        timeout-minutes: 30
+        shell: powershell
+        working-directory: source-therock/rocm-systems
+        run: |
+          $dvc = Get-Command dvc -ErrorAction SilentlyContinue
+          if ($dvc) {
+            $dvcExe = $dvc.Source
+          } else {
+            Write-Host "dvc not on PATH, installing dvc-http into TheRock venv"
+            $py = Join-Path "${{ github.workspace }}" "source-therock\.venv\Scripts\python.exe"
+            & $py -m pip install "dvc==3.67.1" "dvc-http"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $dvcExe = Join-Path "${{ github.workspace }}" "source-therock\.venv\Scripts\dvc.exe"
+          }
+          Write-Host "using $dvcExe"
+          $dirs = @(
+            "shared\amdgpu-windows-interop\pal\lib\Release\x64",
+            "shared\amdgpu-windows-interop\wkmi\win\lib"
+          )
+          $targets = foreach ($d in $dirs) {
+            Get-ChildItem $d -Filter *.dvc | ForEach-Object {
+              ($_.FullName.Substring((Get-Location).Path.Length + 1)) -replace '\\', '/'
+            }
+          }
+          if (-not $targets) {
+            Write-Error "no .dvc pointers under PAL/wkmi"
+            exit 1
+          }
+          Write-Host "pulling $($targets.Count) dvc pointers from genesis"
+          $ErrorActionPreference = "Continue"
+          & $dvcExe pull --force --jobs 8 @targets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path "shared\amdgpu-windows-interop\pal\lib\Release\x64\pal.lib")) {
+            Write-Error "pal.lib missing after dvc pull"
+            exit 1
+          }
+
       - name: Build TheRock SDK
         id: build
         shell: cmd
