@@ -217,12 +217,15 @@ jobs:
           )
           Get-ChildItem "$dist\lib\llvm\bin" -File |
             Where-Object { $keepExe -notcontains $_.Name } | Remove-Item -Force
+          # SOVERSION suffixes move with the ROCm version and not in lockstep
+          # across components (hiprtc is 0716 while comgr is 0714 on gfx117X),
+          # so match by pattern rather than pinning the digits.
           $keepBinDll = @(
-            "amd_comgr0714.dll", "amdhip64_7.dll", "hipblaslt.dll",
-            "hiprtc0714.dll", "hiprtc-builtins0714.dll"
+            "amd_comgr*.dll", "amdhip64_7.dll", "hipblaslt.dll", "hiprtc*.dll"
           )
           Get-ChildItem "$dist\bin" -Filter *.dll |
-            Where-Object { $keepBinDll -notcontains $_.Name } | Remove-Item -Force
+            Where-Object { $n = $_.Name; -not ($keepBinDll | Where-Object { $n -like $_ }) } |
+            Remove-Item -Force
           Get-ChildItem "$dist\lib" -Filter *.lib -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -notmatch '^(amd_comgr|amdhip64|hipblaslt|hiprtc)' } |
             Remove-Item -Force
@@ -250,8 +253,26 @@ jobs:
           if ($LASTEXITCODE -ge 8) {
             exit $LASTEXITCODE
           }
-          Get-ChildItem "$prefix\bin\hipblaslt\library" -Directory |
-            ForEach-Object { Write-Host "hipBLASLt logic: $($_.Name)" }
+          # Re-check after trimming: the verify block above runs pre-trim, so a
+          # keep-list that misses a component is otherwise silent.
+          foreach ($p in @("amdhip64*.dll", "amd_comgr*.dll", "hiprtc*.dll")) {
+            if (-not (Get-ChildItem "$prefix\bin\$p" -ErrorAction SilentlyContinue)) {
+              Write-Host "MISSING after trim: bin\$p"
+              exit 1
+            }
+          }
+          # A dist flatten can write the full Tensile set back over the keep-set:
+          # full is ~48 .co per arch, the keep-set stays under 10.
+          $full = $false
+          foreach ($d in Get-ChildItem "$prefix\bin\hipblaslt\library" -Directory) {
+            $co = (Get-ChildItem $d.FullName -Filter *.co -ErrorAction SilentlyContinue).Count
+            Write-Host "hipBLASLt logic: $($d.Name) ($co .co)"
+            if ($co -gt 20) { $full = $true }
+          }
+          if ($full) {
+            Write-Host "hipBLASLt keep-set was overwritten by the full Tensile set"
+            exit 1
+          }
           exit 0
 
       - name: Upload TheRock SDK
