@@ -1,0 +1,283 @@
+##
+## Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+## Licensed under the MIT License.
+##
+name: Windows TheRock
+
+# Fork-only TheRock SDK source build on the strix_build self-hosted runner.
+# zz002/TheRock is public (actions/checkout). Submodules
+# AMD-ROCm-Internal/rocm-systems and rocm-libraries need the runner user's
+# gh login (job token cannot read that org). Drop GITHUB_ACTIONS so gh can
+# read the keyring, then export that token for fetch_sources.
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
+  THEROCK_REPO: zz002/TheRock
+  THEROCK_REF: feat/gfx117x-mds-support
+
+jobs:
+  therock:
+    if: github.repository == 'zz002/hip-ep'
+    runs-on: strix_build
+    timeout-minutes: 600
+    concurrency:
+      group: deps-therock-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Configure git for TheRock sources
+        shell: powershell
+        run: |
+          git config --global core.symlinks true
+          git config --global core.longpaths true
+
+      - name: Clean leftover TheRock trees
+        shell: powershell
+        run: |
+          $dst = Join-Path "${{ github.workspace }}" "source-therock"
+          if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+          $pfx = Join-Path "${{ runner.workspace }}" "therock-prefix"
+          if (Test-Path $pfx) { Remove-Item -Recurse -Force $pfx }
+
+      - name: Checkout TheRock
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ env.THEROCK_REPO }}
+          ref: ${{ env.THEROCK_REF }}
+          path: source-therock
+          fetch-depth: 1
+          persist-credentials: false
+          show-progress: false
+
+      - name: Use runner gh login
+        id: ghab
+        shell: powershell
+        run: |
+          Remove-Item Env:GITHUB_ACTIONS -ErrorAction SilentlyContinue
+          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          gh auth status
+          if (-not $?) { exit 1 }
+          $token = gh auth token
+          if (-not $token) { Write-Error "gh auth token returned empty"; exit 1 }
+          Write-Host "::add-mask::$token"
+          "token=$token" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          gh auth setup-git
+
+      - name: Record TheRock revision
+        id: key
+        shell: powershell
+        working-directory: source-therock
+        run: |
+          $short = git rev-parse --short=12 HEAD
+          "value=windows-therock-$short-gfx117x" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "cache/artifact key: windows-therock-$short-gfx117x"
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      - name: Initialize TheRock Python environment
+        shell: powershell
+        working-directory: source-therock
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+          "${{ github.workspace }}\source-therock\.venv\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Prepare TheRock sources
+        timeout-minutes: 60
+        shell: powershell
+        working-directory: source-therock
+        env:
+          GH_TOKEN: ${{ steps.ghab.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.ghab.outputs.token }}
+        run: |
+          gh auth setup-git
+          .\.venv\Scripts\python.exe .\build_tools\fetch_sources.py --dvc-projects none
+
+      - name: Pull PAL libs with dvc
+        timeout-minutes: 30
+        shell: powershell
+        working-directory: source-therock/rocm-systems
+        run: |
+          $dvc = Get-Command dvc -ErrorAction SilentlyContinue
+          if ($dvc) {
+            $dvcExe = $dvc.Source
+          } else {
+            Write-Host "dvc not on PATH, installing dvc-http into TheRock venv"
+            $py = Join-Path "${{ github.workspace }}" "source-therock\.venv\Scripts\python.exe"
+            & $py -m pip install "dvc==3.67.1" "dvc-http"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $dvcExe = Join-Path "${{ github.workspace }}" "source-therock\.venv\Scripts\dvc.exe"
+          }
+          Write-Host "using $dvcExe"
+          $dirs = @(
+            "shared\amdgpu-windows-interop\pal\lib\Release\x64",
+            "shared\amdgpu-windows-interop\wkmi\win\lib"
+          )
+          $targets = foreach ($d in $dirs) {
+            Get-ChildItem $d -Filter *.dvc | ForEach-Object {
+              ($_.FullName.Substring((Get-Location).Path.Length + 1)) -replace '\\', '/'
+            }
+          }
+          if (-not $targets) {
+            Write-Error "no .dvc pointers under PAL/wkmi"
+            exit 1
+          }
+          Write-Host "pulling $($targets.Count) dvc pointers from genesis"
+          $ErrorActionPreference = "Continue"
+          & $dvcExe pull --force --jobs 8 @targets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path "shared\amdgpu-windows-interop\pal\lib\Release\x64\pal.lib")) {
+            Write-Error "pal.lib missing after dvc pull"
+            exit 1
+          }
+
+      - name: Add GNU patch to PATH
+        shell: powershell
+        run: |
+          $dirs = @(
+            "C:\Program Files\Git\usr\bin",
+            "C:\Strawberry\usr\bin",
+            "C:\Strawberry\c\bin"
+          )
+          $found = $null
+          foreach ($d in $dirs) {
+            if (Test-Path (Join-Path $d "patch.exe")) {
+              $found = $d
+              break
+            }
+          }
+          if (-not $found) {
+            Write-Error "patch.exe not found (Git usr\bin or Strawberry)"
+            exit 1
+          }
+          $found | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "PATH += $found"
+
+      - name: Build TheRock SDK
+        id: build
+        shell: cmd
+        working-directory: source-therock
+        run: build.bat
+
+      - name: sccache stats
+        if: steps.build.conclusion == 'success' || steps.build.conclusion == 'failure'
+        shell: powershell
+        run: sccache --show-stats
+
+      - name: Verify and stage TheRock SDK
+        shell: powershell
+        working-directory: source-therock
+        run: |
+          $dist = (Resolve-Path .\build\dist\rocm).Path
+          $required = @(
+            "lib\llvm\bin\clang.exe",
+            "lib\llvm\bin\lld.exe",
+            "lib\llvm\bin\clang-offload-bundler.exe",
+            "lib\llvm\amdgcn\bitcode",
+            "bin\hipcc.bat",
+            "bin\hipblaslt.dll",
+            "lib\cmake\hip\hip-config.cmake",
+            "lib\cmake\hip-lang\hip-lang-config.cmake",
+            "lib\cmake\hipblaslt",
+            "lib\cmake\AMDDeviceLibs",
+            "lib\cmake\amd_comgr"
+          )
+          $missing = $required | Where-Object { -not (Test-Path (Join-Path $dist $_)) }
+          if (-not (Get-ChildItem "$dist\bin\amdhip64*.dll" -ErrorAction SilentlyContinue)) {
+            $missing += "bin\amdhip64*.dll"
+          }
+          if (-not (Get-ChildItem "$dist\bin\amd_comgr*.dll" -ErrorAction SilentlyContinue)) {
+            $missing += "bin\amd_comgr*.dll"
+          }
+          if (-not (Get-ChildItem "$dist\bin\hiprtc*.dll" -ErrorAction SilentlyContinue)) {
+            $missing += "bin\hiprtc*.dll"
+          }
+          if (-not (Get-ChildItem "$dist\bin\hipblaslt\library" -Directory -ErrorAction SilentlyContinue)) {
+            $missing += "bin\hipblaslt\library"
+          }
+          if ($missing) {
+            $missing | ForEach-Object { Write-Host "MISSING: $_" }
+            exit 1
+          }
+
+          $before = [math]::Round((Get-ChildItem $dist -Recurse -File | Measure-Object Length -Sum).Sum / 1GB, 2)
+          $keepExe = @(
+            "clang.exe", "clang++.exe", "lld.exe", "lld-link.exe",
+            "llvm-objcopy.exe", "clang-offload-bundler.exe", "amdgpu-arch.exe"
+          )
+          Get-ChildItem "$dist\lib\llvm\bin" -File |
+            Where-Object { $keepExe -notcontains $_.Name } | Remove-Item -Force
+          # SOVERSION suffixes move with the ROCm version and not in lockstep
+          # across components (hiprtc is 0716 while comgr is 0714 on gfx117X),
+          # so match by pattern rather than pinning the digits.
+          $keepBinDll = @(
+            "amd_comgr*.dll", "amdhip64_7.dll", "hipblaslt.dll", "hiprtc*.dll"
+          )
+          Get-ChildItem "$dist\bin" -Filter *.dll |
+            Where-Object { $n = $_.Name; -not ($keepBinDll | Where-Object { $n -like $_ }) } |
+            Remove-Item -Force
+          Get-ChildItem "$dist\lib" -Filter *.lib -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch '^(amd_comgr|amdhip64|hipblaslt|hiprtc)' } |
+            Remove-Item -Force
+          $dropCmake = @(
+            "rocblas", "rocrand", "rocm-core", "rocm-kpack", "hipblas",
+            "hiprand", "fftw3", "fftw3f", "flatbuffers", "mxDataGenerator",
+            "composable_kernel"
+          )
+          foreach ($c in $dropCmake) { Remove-Item "$dist\lib\cmake\$c" -Recurse -Force -ErrorAction SilentlyContinue }
+          $dropInc = @(
+            "ck", "ck_tile", "half", "rapidjson", "nlohmann", "flatbuffers",
+            "rocblas", "rocrand", "rocm-core", "rocm_kpack", "hipblas",
+            "hiprand", "mxDataGenerator", "hsakmt"
+          )
+          foreach ($i in $dropInc) { Remove-Item "$dist\include\$i" -Recurse -Force -ErrorAction SilentlyContinue }
+          Remove-Item "$dist\lib\llvm\include" -Recurse -Force -ErrorAction SilentlyContinue
+          Get-ChildItem "$dist\lib\llvm\lib" -File -Filter *.lib -ErrorAction SilentlyContinue | Remove-Item -Force
+          Remove-Item "$dist\.info", "$dist\.kpack", "$dist\libexec" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "$dist\bin\rocblas" -Recurse -Force -ErrorAction SilentlyContinue
+          $after = [math]::Round((Get-ChildItem $dist -Recurse -File | Measure-Object Length -Sum).Sum / 1GB, 2)
+          Write-Host "dist trimmed: ${before} GB -> ${after} GB"
+
+          $prefix = "${{ runner.workspace }}\therock-prefix"
+          robocopy $dist $prefix /MIR /NFL /NDL /NJH /NJS /NP
+          if ($LASTEXITCODE -ge 8) {
+            exit $LASTEXITCODE
+          }
+          # Re-check after trimming: the verify block above runs pre-trim, so a
+          # keep-list that misses a component is otherwise silent.
+          foreach ($p in @("amdhip64*.dll", "amd_comgr*.dll", "hiprtc*.dll")) {
+            if (-not (Get-ChildItem "$prefix\bin\$p" -ErrorAction SilentlyContinue)) {
+              Write-Host "MISSING after trim: bin\$p"
+              exit 1
+            }
+          }
+          # A dist flatten can write the full Tensile set back over the keep-set:
+          # full is ~48 .co per arch, the keep-set stays under 10.
+          $full = $false
+          foreach ($d in Get-ChildItem "$prefix\bin\hipblaslt\library" -Directory) {
+            $co = (Get-ChildItem $d.FullName -Filter *.co -ErrorAction SilentlyContinue).Count
+            Write-Host "hipBLASLt logic: $($d.Name) ($co .co)"
+            if ($co -gt 20) { $full = $true }
+          }
+          if ($full) {
+            Write-Host "hipBLASLt keep-set was overwritten by the full Tensile set"
+            exit 1
+          }
+          exit 0
+
+      - name: Upload TheRock SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.key.outputs.value }}
+          path: ${{ runner.workspace }}/therock-prefix
+          retention-days: 7
