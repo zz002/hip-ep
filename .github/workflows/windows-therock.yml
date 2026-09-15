@@ -100,7 +100,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.ghab.outputs.token }}
         run: |
           gh auth setup-git
-          .\.venv\Scripts\python.exe .\build_tools\fetch_sources.py --dvc-projects rocm-systems
+          .\.venv\Scripts\python.exe .\build_tools\fetch_sources.py --dvc-projects none
 
       - name: Build TheRock SDK
         id: build
