@@ -5,9 +5,10 @@
 name: Windows TheRock
 
 # Fork-only TheRock SDK source build on the strix_build self-hosted runner.
-# Submodules AMD-ROCm-Internal/rocm-systems and rocm-libraries need the
-# runner user's gh login (job token cannot read that org). Drop
-# GITHUB_ACTIONS so gh can read the keyring, then export that token.
+# zz002/TheRock is public (actions/checkout). Submodules
+# AMD-ROCm-Internal/rocm-systems and rocm-libraries need the runner user's
+# gh login (job token cannot read that org). Drop GITHUB_ACTIONS so gh can
+# read the keyring, then export that token for fetch_sources.
 on:
   workflow_dispatch:
   pull_request:
@@ -45,6 +46,16 @@ jobs:
           $pfx = Join-Path "${{ runner.workspace }}" "therock-prefix"
           if (Test-Path $pfx) { Remove-Item -Recurse -Force $pfx }
 
+      - name: Checkout TheRock
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ env.THEROCK_REPO }}
+          ref: ${{ env.THEROCK_REF }}
+          path: source-therock
+          fetch-depth: 1
+          persist-credentials: false
+          show-progress: false
+
       - name: Use runner gh login
         id: ghab
         shell: powershell
@@ -59,16 +70,6 @@ jobs:
           Write-Host "::add-mask::$token"
           "token=$token" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           gh auth setup-git
-
-      - name: Clone TheRock with gh
-        shell: powershell
-        working-directory: ${{ github.workspace }}
-        env:
-          GH_TOKEN: ${{ steps.ghab.outputs.token }}
-          GITHUB_TOKEN: ${{ steps.ghab.outputs.token }}
-        run: |
-          gh auth setup-git
-          gh repo clone ${{ env.THEROCK_REPO }} source-therock -- --branch ${{ env.THEROCK_REF }} --depth 1
 
       - name: Record TheRock revision
         id: key
