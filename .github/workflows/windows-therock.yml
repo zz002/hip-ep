@@ -85,10 +85,11 @@ jobs:
       - name: Prepare sccache directory
         shell: powershell
         run: |
-          $dir = Join-Path "${{ runner.workspace }}" "sccache-dir"
+          $dir = Join-Path $env:USERPROFILE "sccache"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           "SCCACHE_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "SCCACHE_CACHE_SIZE=20G" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "SCCACHE_DIR=$dir"
 
       - name: Start sccache
         shell: powershell
