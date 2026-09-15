@@ -5,8 +5,9 @@
 name: Windows TheRock
 
 # Fork-only TheRock SDK source build on the strix_build self-hosted runner.
-# Clones zz002/TheRock@feat/gfx117x-mds-support with the runner's local gh
-# login (GITHUB_TOKEN is unset so gh does not pick up the job token).
+# The job token cannot use the runner keyring (gh ignores it when
+# GITHUB_ACTIONS is set). The first step drops that flag, switches to zz002,
+# and exports that account's token as GH_TOKEN.
 on:
   workflow_dispatch:
   pull_request:
@@ -44,13 +45,25 @@ jobs:
           $pfx = Join-Path "${{ runner.workspace }}" "therock-prefix"
           if (Test-Path $pfx) { Remove-Item -Recurse -Force $pfx }
 
+      - name: Use zz002 gh login from runner keyring
+        shell: powershell
+        run: |
+          Remove-Item Env:GITHUB_ACTIONS -ErrorAction SilentlyContinue
+          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          gh auth switch --hostname github.com --user zz002
+          if (-not $?) { exit 1 }
+          $token = gh auth token --user zz002
+          if (-not $token) { Write-Error "gh auth token --user zz002 returned empty"; exit 1 }
+          Write-Host "::add-mask::$token"
+          "GH_TOKEN=$token" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          gh auth setup-git
+          gh auth status
+
       - name: Clone TheRock with local gh
         shell: powershell
         working-directory: ${{ github.workspace }}
         run: |
-          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
-          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
-          gh auth setup-git
           gh auth status
           gh repo clone ${{ env.THEROCK_REPO }} source-therock -- --branch ${{ env.THEROCK_REF }} --depth 1
 
@@ -80,8 +93,6 @@ jobs:
         shell: powershell
         working-directory: source-therock
         run: |
-          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
-          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
           gh auth setup-git
           .\.venv\Scripts\python.exe .\build_tools\fetch_sources.py --dvc-projects rocm-systems
 
