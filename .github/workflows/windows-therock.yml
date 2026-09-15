@@ -140,6 +140,28 @@ jobs:
             exit 1
           }
 
+      - name: Add GNU patch to PATH
+        shell: powershell
+        run: |
+          $dirs = @(
+            "C:\Program Files\Git\usr\bin",
+            "C:\Strawberry\usr\bin",
+            "C:\Strawberry\c\bin"
+          )
+          $found = $null
+          foreach ($d in $dirs) {
+            if (Test-Path (Join-Path $d "patch.exe")) {
+              $found = $d
+              break
+            }
+          }
+          if (-not $found) {
+            Write-Error "patch.exe not found (Git usr\bin or Strawberry)"
+            exit 1
+          }
+          $found | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "PATH += $found"
+
       - name: Build TheRock SDK
         id: build
         shell: cmd
