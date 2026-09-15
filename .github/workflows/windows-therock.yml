@@ -69,7 +69,7 @@ jobs:
         shell: powershell
         working-directory: source-therock
         run: |
-          py -3.12 -m venv .venv
+          python -m venv .venv
           .\.venv\Scripts\python.exe -m pip install --upgrade pip
           .\.venv\Scripts\python.exe -m pip install -r requirements.txt
           "${{ github.workspace }}\source-therock\.venv\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
