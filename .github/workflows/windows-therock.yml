@@ -90,8 +90,16 @@ jobs:
           "SCCACHE_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "SCCACHE_CACHE_SIZE=20G" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Start sccache
+        shell: powershell
+        run: |
+          $sccache = Get-Command sccache -ErrorAction SilentlyContinue
+          if (-not $sccache) {
+            Write-Error "sccache not on PATH"
+            exit 1
+          }
+          Write-Host "using $($sccache.Source)"
+          sccache --show-stats
 
       - name: Initialize TheRock Python environment
         shell: powershell
@@ -114,12 +122,13 @@ jobs:
           .\.venv\Scripts\python.exe .\build_tools\fetch_sources.py --dvc-projects rocm-systems
 
       - name: Build TheRock SDK
+        id: build
         shell: cmd
         working-directory: source-therock
         run: build.bat
 
       - name: sccache stats
-        if: always()
+        if: steps.build.conclusion == 'success' || steps.build.conclusion == 'failure'
         shell: powershell
         run: |
           sccache --show-stats
