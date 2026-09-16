@@ -475,6 +475,10 @@ jobs:
         timeout-minutes: 180
         run: |
           . (Join-Path $env:SB_ROOT "helpers.ps1")
+          # Tensile drives clang directly for most of this step, so sccache sees
+          # no requests, its server reaches the idle timeout and the counters
+          # reset. Report what the five earlier steps achieved before that.
+          sccache --show-stats
           $libs = Join-Path $env:SB_SRC "rocm-libraries"
           $sdk = Convert-Fwd $env:SB_SDK
           $prefix = Get-PrefixPath
@@ -645,8 +649,15 @@ jobs:
           Get-ChildItem (Join-Path $dist "lib") -Filter "*.lib" -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -notmatch '^(amd_comgr|amdhip64|hipblaslt|hiprtc)' } |
             ForEach-Object { Remove-Item $_.FullName -Force }
+          # A full LLVM install also drops libclang, LTO and Remarks into bin;
+          # none of them are consumed and together they are over 150 MB. Match by
+          # pattern because the runtime DLLs carry ROCm version suffixes.
+          $keepBinDll = @("amd_comgr*.dll", "amdhip64_*.dll", "hipblaslt.dll", "hiprtc*.dll")
+          Get-ChildItem (Join-Path $dist "bin") -Filter "*.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $n = $_.Name; -not ($keepBinDll | Where-Object { $n -like $_ }) } |
+            ForEach-Object { Remove-Item $_.FullName -Force }
 
-          foreach ($p in @("amdhip64*.dll", "amd_comgr*.dll", "hiprtc*.dll")) {
+          foreach ($p in @("amdhip64*.dll", "amd_comgr*.dll", "hiprtc*.dll", "hipblaslt.dll")) {
             if (-not (Get-ChildItem (Join-Path $dist "bin") -Filter $p -ErrorAction SilentlyContinue)) {
               Write-Host "MISSING after trim: bin\$p"
               exit 1
