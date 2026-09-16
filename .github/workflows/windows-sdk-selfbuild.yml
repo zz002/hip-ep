@@ -462,6 +462,14 @@ jobs:
             $ver = @(Get-ChildItem $libdir -Filter "amdhip64_*.lib" -ErrorAction SilentlyContinue)
             if ($ver.Count -ge 1) { Copy-Item $ver[0].FullName $legacy }
           }
+          # hipamd's install REMOVE_RECURSEs the prefix include dir on Windows,
+          # taking amd_comgr's header with it. Its lib/cmake export survives, so
+          # only the headers need restoring, and stinkytofu needs them.
+          Invoke-Checked cmake --install (Join-Path $env:SB_BUILD "comgr")
+          if (-not (Test-Path (Join-Path $env:SB_SDK "include\amd_comgr\amd_comgr.h"))) {
+            Write-Error "amd_comgr.h missing after restoring the comgr install"
+            exit 1
+          }
 
       - name: 6. Build hipBLASLt
         timeout-minutes: 180
@@ -591,6 +599,7 @@ jobs:
             "bin\amdgpu-arch.exe",
             "amdgcn\bitcode",
             "lib\clang",
+            "include\amd_comgr\amd_comgr.h",
             "bin\hipblaslt.dll",
             "bin\hipblaslt\library\gfx1151",
             "lib\cmake\hip\hip-config.cmake",
