@@ -27,6 +27,8 @@ env:
   ROCM_LIBRARIES_PIN: c37db3c207f8ef558590900bdd575a48df3b356c
   ZLIB_URL: https://rocm-third-party-deps.s3.us-east-2.amazonaws.com/zlib-1.3.2.tar.gz
   ZLIB_SHA256: bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16
+  ZSTD_URL: https://rocm-third-party-deps.s3.us-east-2.amazonaws.com/zstd-1.5.7.tar.gz
+  ZSTD_SHA256: eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
   MSGPACK_URL: https://rocm-third-party-deps.s3.us-east-2.amazonaws.com/msgpack-cxx-7.0.0.tar.gz
   MSGPACK_SHA256: 7504b7af7e7b9002ce529d4f941e1b7fb1fb435768780ce7da4abaac79bb156f
   # Tarball name follows cmake/deps.txt: <what>-dist-windows-<archs>-<version>-<variant>.
@@ -215,6 +217,34 @@ jobs:
           } else {
             Write-Host "zlib already installed"
           }
+          $zstdLib = Join-Path $tp "lib\zstd_static.lib"
+          if (-not (Test-Path $zstdLib)) {
+            $tgz = Join-Path $src "zstd-1.5.7.tar.gz"
+            Invoke-Checked curl.exe -L --fail --retry 3 -o $tgz $env:ZSTD_URL
+            $hash = (Get-FileHash $tgz -Algorithm SHA256).Hash.ToLower()
+            if ($hash -ne $env:ZSTD_SHA256) { Write-Error "zstd sha256 mismatch: $hash"; exit 1 }
+            Invoke-Checked tar.exe -xf $tgz -C $src
+            $zssrc = Join-Path $src "zstd-1.5.7\build\cmake"
+            $zsb = Join-Path $env:SB_BUILD "zstd"
+            Invoke-Checked cmake -G Ninja -S $zssrc -B $zsb `
+              "-DCMAKE_BUILD_TYPE=Release" `
+              "-DCMAKE_INSTALL_PREFIX=$(Convert-Fwd $tp)" `
+              "-DCMAKE_C_COMPILER=cl.exe" `
+              "-DCMAKE_CXX_COMPILER=cl.exe" `
+              "-DCMAKE_LINKER=link.exe" `
+              "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" `
+              "-DZSTD_BUILD_SHARED=OFF" `
+              "-DZSTD_BUILD_STATIC=ON" `
+              "-DZSTD_BUILD_PROGRAMS=OFF" `
+              "-DZSTD_BUILD_TESTS=OFF" `
+              "-DZSTD_LEGACY_SUPPORT=OFF" `
+              "-DCMAKE_C_COMPILER_LAUNCHER=sccache" `
+              "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
+            Invoke-Checked cmake --build $zsb
+            Invoke-Checked cmake --install $zsb
+          } else {
+            Write-Host "zstd already installed"
+          }
           $msgpackH = Join-Path $tp "include\msgpack.hpp"
           if (-not (Test-Path $msgpackH)) {
             $tgz = Join-Path $src "msgpack-cxx-7.0.0.tar.gz"
@@ -318,7 +348,11 @@ jobs:
             "-DLLVM_ENABLE_RUNTIMES=compiler-rt",
             "-DLLVM_TARGETS_TO_BUILD=AMDGPU;Native",
             "-DLLVM_ENABLE_ZLIB=FORCE_ON",
-            "-DLLVM_ENABLE_ZSTD=OFF",
+            # Without zstd, clang-offload-bundler --compress falls back to zlib
+            # and the Tensile .co grow about 3x. FORCE_ON so a missing zstd
+            # fails configure rather than silently shipping zlib bundles.
+            "-DLLVM_ENABLE_ZSTD=FORCE_ON",
+            "-DLLVM_USE_STATIC_ZSTD=ON",
             "-DLLVM_ENABLE_Z3_SOLVER=OFF",
             "-DLLVM_ENABLE_LIBXML2=OFF",
             "-DLLVM_INCLUDE_TESTS=OFF",
@@ -689,6 +723,25 @@ jobs:
           }
           if ($full) {
             Write-Host "hipBLASLt keep-set was overwritten by the full Tensile set"
+            exit 1
+          }
+
+          # A compressed offload bundle starts with CCOB and carries a u16
+          # compression method at offset 6, where 1 is zstd and 0 the zlib
+          # fallback. extop_*.co is written without the bundler, so only the
+          # Tensile objects are bundles.
+          $notZstd = @()
+          foreach ($f in Get-ChildItem $libRoot -Recurse -Filter "TensileLibrary_*.co" -ErrorAction SilentlyContinue) {
+            $head = [System.IO.File]::ReadAllBytes($f.FullName)
+            if ($head.Length -lt 8 -or [System.Text.Encoding]::ASCII.GetString($head, 0, 4) -ne "CCOB") {
+              $notZstd += "$($f.Name): not a compressed bundle"
+              continue
+            }
+            $method = [System.BitConverter]::ToUInt16($head, 6)
+            if ($method -ne 1) { $notZstd += "$($f.Name): compression method $method" }
+          }
+          if ($notZstd.Count -gt 0) {
+            $notZstd | ForEach-Object { Write-Host "NOT ZSTD: $_" }
             exit 1
           }
 
