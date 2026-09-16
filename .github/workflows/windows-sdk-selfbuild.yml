@@ -1,0 +1,777 @@
+##
+## Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+## Licensed under the MIT License.
+##
+name: Windows SDK Selfbuild
+
+# Flat-layout ROCm SDK from six independent cmake builds. Pins live in env
+# (no extra manifest file). Every run builds from scratch; cross-run speed comes
+# from sccache, which keeps whatever cache directory the runner is configured with.
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
+  LLVM_REPO: https://github.com/ROCm/llvm-project.git
+  LLVM_PIN: 2904a87d4ddd4d3dd3aaed86fc38c2278b284fd3
+  ROCM_CMAKE_REPO: https://github.com/ROCm/rocm-cmake.git
+  ROCM_CMAKE_PIN: 10155d7272ea1bf79f6b5a9dbc339657af1aa372
+  ROCM_SYSTEMS_REPO: https://github.com/AMD-ROCm-Internal/rocm-systems.git
+  ROCM_SYSTEMS_PIN: b0bc2cc5fd3f9c296336612764df5edbf0a0f205
+  ROCM_LIBRARIES_REPO: https://github.com/AMD-ROCm-Internal/rocm-libraries.git
+  ROCM_LIBRARIES_PIN: c37db3c207f8ef558590900bdd575a48df3b356c
+  ZLIB_URL: https://rocm-third-party-deps.s3.us-east-2.amazonaws.com/zlib-1.3.2.tar.gz
+  ZLIB_SHA256: bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16
+  ZSTD_URL: https://rocm-third-party-deps.s3.us-east-2.amazonaws.com/zstd-1.5.7.tar.gz
+  ZSTD_SHA256: eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+  MSGPACK_URL: https://rocm-third-party-deps.s3.us-east-2.amazonaws.com/msgpack-cxx-7.0.0.tar.gz
+  MSGPACK_SHA256: 7504b7af7e7b9002ce529d4f941e1b7fb1fb435768780ce7da4abaac79bb156f
+  # Tarball name follows cmake/deps.txt: <what>-dist-windows-<archs>-<version>-<variant>.
+  # The version comes from the HIP source tree, these two describe this build.
+  DIST_ARCH_TAG: gfx115x-gfx1170
+  DIST_VARIANT: hipblaslt-trimmed
+  GPU_ARCHS: gfx1150;gfx1151;gfx1152;gfx1153;gfx1170
+
+jobs:
+  selfbuild:
+    if: github.repository == 'zz002/hip-ep'
+    runs-on: strix_build
+    timeout-minutes: 600
+    concurrency:
+      # Per-branch, so stacked PRs never cancel each other; a group keeps only
+      # one pending run, so a shared group made every second push discard a
+      # queued build. Builds still serialize because strix_build is a single
+      # runner, and every run shares one prefix and build tree under
+      # runner.workspace: a second runner carrying this label would need
+      # per-branch working directories before it could be used.
+      group: sdk-selfbuild-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        shell: powershell
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: "8"
+
+    steps:
+      - name: Configure git for long paths
+        run: |
+          git config --global core.symlinks true
+          git config --global core.longpaths true
+
+      - name: Use runner gh login
+        id: ghab
+        run: |
+          Remove-Item Env:GITHUB_ACTIONS -ErrorAction SilentlyContinue
+          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          gh auth status
+          if (-not $?) { exit 1 }
+          $token = gh auth token
+          if (-not $token) { Write-Error "gh auth token returned empty"; exit 1 }
+          Write-Host "::add-mask::$token"
+          "token=$token" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          gh auth setup-git
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      - name: Prepare workspace
+        id: paths
+        run: |
+          $ws = Split-Path "${{ github.workspace }}" -Parent
+          $root = Join-Path $ws "sdk-selfbuild"
+          $sdk = Join-Path $root "rocm"
+          $src = Join-Path $root "src"
+          $build = Join-Path $root "build"
+          $tp = Join-Path $root "thirdparty"
+          # Build trees, install prefix and third-party prefix start empty every
+          # run; sccache is what keeps that affordable. The clones survive because
+          # they are pinned by sha and re-fetched only when a pin moves.
+          foreach ($d in @($build, $sdk, $tp)) {
+            if (Test-Path $d) {
+              Write-Host "removing $d"
+              Remove-Item -Recurse -Force $d
+            }
+          }
+          @(
+            "SB_ROOT=$root",
+            "SB_SDK=$sdk",
+            "SB_SRC=$src",
+            "SB_BUILD=$build",
+            "SB_TP=$tp"
+          ) | ForEach-Object { $_ | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append }
+          $env:SB_ROOT = $root
+          $env:SB_SDK = $sdk
+          $env:SB_SRC = $src
+          $env:SB_BUILD = $build
+          $env:SB_TP = $tp
+          foreach ($d in @($root, $sdk, $src, $build, $tp)) {
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+          }
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            Write-Error "ninja not on PATH"
+            exit 1
+          }
+          if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+            Write-Error "python not on PATH"
+            exit 1
+          }
+          $helper = Join-Path $env:SB_ROOT "helpers.ps1"
+          @'
+          function Invoke-Checked {
+            # curl progress, cmake warnings and git fetch all use stderr.
+            $ErrorActionPreference = 'Continue'
+            $exe = $args[0]
+            $rest = @()
+            if ($args.Length -gt 1) { $rest = $args[1..($args.Length - 1)] }
+            & $exe @rest
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          function Convert-Fwd([string]$p) { return ($p -replace '\\', '/') }
+          function Ensure-PinnedRepo {
+            param([string]$Url, [string]$Dir, [string]$Pin)
+            # git writes progress and "unknown revision HEAD" to stderr, which
+            # the runner's ErrorActionPreference=Stop turns into a terminating
+            # error. Gate on $LASTEXITCODE instead.
+            $ErrorActionPreference = 'Continue'
+            if (-not (Test-Path (Join-Path $Dir '.git'))) {
+              New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+              git -C $Dir init
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              git -C $Dir remote add origin $Url
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            $head = git -C $Dir rev-parse --verify --quiet HEAD
+            if ($LASTEXITCODE -eq 0 -and $head -eq $Pin) {
+              Write-Host "already at $Pin : $Dir"
+              return
+            }
+            git -C $Dir fetch --depth 1 origin $Pin
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            git -C $Dir checkout --detach FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $got = git -C $Dir rev-parse HEAD
+            if ($got -ne $Pin) {
+              Write-Error "expected $Pin got $got in $Dir"
+              exit 1
+            }
+          }
+          function Get-PrefixPath {
+            return ((Convert-Fwd $env:SB_SDK) + ';' + (Convert-Fwd $env:SB_TP))
+          }
+          '@ | Set-Content -Encoding ASCII $helper
+          sccache --show-stats
+          "sdk=$($sdk -replace '\\', '/')" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Clone sources
+        env:
+          GH_TOKEN: ${{ steps.ghab.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.ghab.outputs.token }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          . (Join-Path $env:SB_ROOT "helpers.ps1")
+          gh auth setup-git
+          Ensure-PinnedRepo -Url $env:LLVM_REPO -Dir (Join-Path $env:SB_SRC "llvm-project") -Pin $env:LLVM_PIN
+          Ensure-PinnedRepo -Url $env:ROCM_CMAKE_REPO -Dir (Join-Path $env:SB_SRC "rocm-cmake") -Pin $env:ROCM_CMAKE_PIN
+          Ensure-PinnedRepo -Url $env:ROCM_SYSTEMS_REPO -Dir (Join-Path $env:SB_SRC "rocm-systems") -Pin $env:ROCM_SYSTEMS_PIN
+          Ensure-PinnedRepo -Url $env:ROCM_LIBRARIES_REPO -Dir (Join-Path $env:SB_SRC "rocm-libraries") -Pin $env:ROCM_LIBRARIES_PIN
+
+      - name: Build third-party deps
+        run: |
+          . (Join-Path $env:SB_ROOT "helpers.ps1")
+          $tp = $env:SB_TP
+          $src = Join-Path $tp "src"
+          New-Item -ItemType Directory -Force -Path $src | Out-Null
+          # Keyed on the archive rather than zlib.h: the header alone would mark
+          # a partially provisioned prefix as done.
+          $zlibLib = Join-Path $tp "lib\zlibstatic.lib"
+          if (-not (Test-Path $zlibLib)) {
+            $tgz = Join-Path $src "zlib-1.3.2.tar.gz"
+            Invoke-Checked curl.exe -L --fail --retry 3 -o $tgz $env:ZLIB_URL
+            $hash = (Get-FileHash $tgz -Algorithm SHA256).Hash.ToLower()
+            if ($hash -ne $env:ZLIB_SHA256) { Write-Error "zlib sha256 mismatch: $hash"; exit 1 }
+            Invoke-Checked tar.exe -xf $tgz -C $src
+            $zsrc = Join-Path $src "zlib-1.3.2"
+            $zb = Join-Path $env:SB_BUILD "zlib"
+            Invoke-Checked cmake -G Ninja -S $zsrc -B $zb `
+              "-DCMAKE_BUILD_TYPE=Release" `
+              "-DCMAKE_INSTALL_PREFIX=$(Convert-Fwd $tp)" `
+              "-DCMAKE_C_COMPILER=cl.exe" `
+              "-DCMAKE_CXX_COMPILER=cl.exe" `
+              "-DCMAKE_LINKER=link.exe" `
+              "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" `
+              "-DZLIB_BUILD_SHARED=OFF" `
+              "-DZLIB_BUILD_TESTING=OFF" `
+              "-DCMAKE_C_COMPILER_LAUNCHER=sccache" `
+              "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
+            Invoke-Checked cmake --build $zb
+            Invoke-Checked cmake --install $zb
+            # zlib names its static archive zs.lib (OUTPUT_NAME z$zlib_static_suffix),
+            # but FindZLIB only searches zlibstatic/zlibstat/zlib/z.
+            Copy-Item (Join-Path $tp "lib\zs.lib") $zlibLib -Force
+          } else {
+            Write-Host "zlib already installed"
+          }
+          $zstdLib = Join-Path $tp "lib\zstd_static.lib"
+          if (-not (Test-Path $zstdLib)) {
+            $tgz = Join-Path $src "zstd-1.5.7.tar.gz"
+            Invoke-Checked curl.exe -L --fail --retry 3 -o $tgz $env:ZSTD_URL
+            $hash = (Get-FileHash $tgz -Algorithm SHA256).Hash.ToLower()
+            if ($hash -ne $env:ZSTD_SHA256) { Write-Error "zstd sha256 mismatch: $hash"; exit 1 }
+            Invoke-Checked tar.exe -xf $tgz -C $src
+            $zssrc = Join-Path $src "zstd-1.5.7\build\cmake"
+            $zsb = Join-Path $env:SB_BUILD "zstd"
+            Invoke-Checked cmake -G Ninja -S $zssrc -B $zsb `
+              "-DCMAKE_BUILD_TYPE=Release" `
+              "-DCMAKE_INSTALL_PREFIX=$(Convert-Fwd $tp)" `
+              "-DCMAKE_C_COMPILER=cl.exe" `
+              "-DCMAKE_CXX_COMPILER=cl.exe" `
+              "-DCMAKE_LINKER=link.exe" `
+              "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" `
+              "-DZSTD_BUILD_SHARED=OFF" `
+              "-DZSTD_BUILD_STATIC=ON" `
+              "-DZSTD_BUILD_PROGRAMS=OFF" `
+              "-DZSTD_BUILD_TESTS=OFF" `
+              "-DZSTD_LEGACY_SUPPORT=OFF" `
+              "-DCMAKE_C_COMPILER_LAUNCHER=sccache" `
+              "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
+            Invoke-Checked cmake --build $zsb
+            Invoke-Checked cmake --install $zsb
+          } else {
+            Write-Host "zstd already installed"
+          }
+          $msgpackH = Join-Path $tp "include\msgpack.hpp"
+          if (-not (Test-Path $msgpackH)) {
+            $tgz = Join-Path $src "msgpack-cxx-7.0.0.tar.gz"
+            Invoke-Checked curl.exe -L --fail --retry 3 -o $tgz $env:MSGPACK_URL
+            $hash = (Get-FileHash $tgz -Algorithm SHA256).Hash.ToLower()
+            if ($hash -ne $env:MSGPACK_SHA256) { Write-Error "msgpack sha256 mismatch: $hash"; exit 1 }
+            Invoke-Checked tar.exe -xf $tgz -C $src
+            $msrc = Join-Path $src "msgpack-cxx-7.0.0"
+            $mb = Join-Path $env:SB_BUILD "msgpack"
+            Invoke-Checked cmake -G Ninja -S $msrc -B $mb `
+              "-DCMAKE_BUILD_TYPE=Release" `
+              "-DCMAKE_INSTALL_PREFIX=$(Convert-Fwd $tp)" `
+              "-DMSGPACK_USE_BOOST=OFF" `
+              "-DMSGPACK_BUILD_DOCS=OFF" `
+              "-DMSGPACK_BUILD_TESTS=OFF" `
+              "-DMSGPACK_BUILD_EXAMPLES=OFF"
+            Invoke-Checked cmake --install $mb
+          } else {
+            Write-Host "msgpack-cxx already installed"
+          }
+          $rocmCfg = Join-Path $tp "share\rocmcmakebuildtools\cmake\ROCmCMakeBuildToolsConfig.cmake"
+          if (-not (Test-Path $rocmCfg)) {
+            $rb = Join-Path $env:SB_BUILD "rocm-cmake"
+            Invoke-Checked cmake -S (Join-Path $env:SB_SRC "rocm-cmake") -B $rb `
+              "-DCMAKE_INSTALL_PREFIX=$(Convert-Fwd $tp)" `
+              "-DBUILD_TESTING=OFF"
+            Invoke-Checked cmake --install $rb
+          } else {
+            Write-Host "rocm-cmake already installed"
+          }
+
+      - name: Pull PAL libs with dvc
+        timeout-minutes: 30
+        run: |
+          $sys = Join-Path $env:SB_SRC "rocm-systems"
+          Set-Location $sys
+          $dvc = Get-Command dvc -ErrorAction SilentlyContinue
+          if ($dvc) {
+            $dvcExe = $dvc.Source
+          } else {
+            Write-Host "dvc not on PATH, installing dvc-http into a local venv"
+            $venv = Join-Path $env:SB_ROOT "venv-dvc"
+            if (-not (Test-Path (Join-Path $venv "Scripts\python.exe"))) {
+              python -m venv $venv
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            $py = Join-Path $venv "Scripts\python.exe"
+            & $py -m pip install --upgrade pip
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & $py -m pip install "dvc==3.67.1" "dvc-http"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $dvcExe = Join-Path $venv "Scripts\dvc.exe"
+          }
+          Write-Host "using $dvcExe"
+          $dirs = @(
+            "shared\amdgpu-windows-interop\pal\lib\Release\x64",
+            "shared\amdgpu-windows-interop\wkmi\win\lib"
+          )
+          $targets = foreach ($d in $dirs) {
+            Get-ChildItem $d -Filter *.dvc | ForEach-Object {
+              ($_.FullName.Substring((Get-Location).Path.Length + 1)) -replace '\\', '/'
+            }
+          }
+          if (-not $targets) {
+            Write-Error "no .dvc pointers under PAL/wkmi"
+            exit 1
+          }
+          Write-Host "pulling $($targets.Count) dvc pointers from genesis"
+          $ErrorActionPreference = "Continue"
+          & $dvcExe pull --force --jobs 8 @targets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path "shared\amdgpu-windows-interop\pal\lib\Release\x64\pal.lib")) {
+            Write-Error "pal.lib missing after dvc pull"
+            exit 1
+          }
+
+      - name: 1. Build llvm (clang + lld)
+        timeout-minutes: 240
+        run: |
+          . (Join-Path $env:SB_ROOT "helpers.ps1")
+          $src = Join-Path $env:SB_SRC "llvm-project\llvm"
+          $b = Join-Path $env:SB_BUILD "llvm"
+          $prefix = Get-PrefixPath
+          $sdk = Convert-Fwd $env:SB_SDK
+          $dist = "clang;clang-resource-headers;lld;llvm-objcopy;clang-offload-bundler;offload-arch;llvm-ar;llvm-link;opt;cmake-exports;clang-cmake-exports;lld-cmake-exports;llvm-libraries;clang-libraries;lld-libraries"
+          $common = @(
+            "-G", "Ninja",
+            "-S", $src,
+            "-B", $b,
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_INSTALL_PREFIX=$sdk",
+            "-DCMAKE_PREFIX_PATH=$prefix",
+            "-DCMAKE_C_COMPILER=cl.exe",
+            "-DCMAKE_CXX_COMPILER=cl.exe",
+            "-DCMAKE_LINKER=link.exe",
+            "-DCMAKE_C_COMPILER_LAUNCHER=sccache",
+            "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache",
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
+            "-DLLVM_USE_MSVC_STATIC_RUNTIME=ON",
+            "-DLLVM_ENABLE_PROJECTS=clang;lld",
+            "-DLLVM_ENABLE_RUNTIMES=compiler-rt",
+            "-DLLVM_TARGETS_TO_BUILD=AMDGPU;Native",
+            "-DLLVM_ENABLE_ZLIB=FORCE_ON",
+            # Without zstd, clang-offload-bundler --compress falls back to zlib
+            # and the Tensile .co grow about 3x. FORCE_ON so a missing zstd
+            # fails configure rather than silently shipping zlib bundles.
+            "-DLLVM_ENABLE_ZSTD=FORCE_ON",
+            "-DLLVM_USE_STATIC_ZSTD=ON",
+            "-DLLVM_ENABLE_Z3_SOLVER=OFF",
+            "-DLLVM_ENABLE_LIBXML2=OFF",
+            "-DLLVM_INCLUDE_TESTS=OFF",
+            "-DLLVM_INCLUDE_EXAMPLES=OFF",
+            "-DLLVM_INCLUDE_BENCHMARKS=OFF",
+            "-DLLVM_BUILD_LLVM_DYLIB=OFF",
+            "-DLLVM_LINK_LLVM_DYLIB=OFF",
+            "-DLLVM_BUILD_LLVM_C_DYLIB=OFF",
+            "-DLLVM_INSTALL_TOOLCHAIN_ONLY=OFF",
+            "-DLLVM_APPEND_VC_REV=ON",
+            "-DLLVM_PARALLEL_LINK_JOBS=2",
+            "-DZLIB_USE_STATIC_LIBS=ON",
+            "-DCLANG_DEFAULT_LINKER=lld",
+            "-DCLANG_DEFAULT_RTLIB=compiler-rt",
+            "-DCLANG_DEFAULT_UNWINDLIB=libgcc",
+            "-DCLANG_ENABLE_AMDCLANG=ON",
+            "-DCLANG_ENABLE_ARCMT=OFF",
+            "-DCLANG_ENABLE_STATIC_ANALYZER=OFF",
+            "-DCLANG_ENABLE_CLANGD=OFF",
+            "-DBUILD_TESTING=OFF"
+          )
+          & cmake @common "-DLLVM_DISTRIBUTION_COMPONENTS=$dist" "-DLLVM_RUNTIME_DISTRIBUTION_COMPONENTS=compiler-rt"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "configure failed; retrying without LLVM_DISTRIBUTION_COMPONENTS"
+            if (Test-Path $b) { Remove-Item -Recurse -Force $b }
+            Invoke-Checked cmake @common
+            Invoke-Checked cmake --build $b
+            Invoke-Checked cmake --install $b
+          } else {
+            Invoke-Checked cmake --build $b --target install-distribution
+          }
+          $sdkBin = Join-Path $env:SB_SDK "bin"
+          $sdkBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          if (-not (Test-Path (Join-Path $sdkBin "clang.exe"))) {
+            Write-Error "clang.exe missing after llvm install"
+            exit 1
+          }
+
+      - name: 2. Build hipcc
+        run: |
+          . (Join-Path $env:SB_ROOT "helpers.ps1")
+          $src = Join-Path $env:SB_SRC "llvm-project\amd\hipcc"
+          $b = Join-Path $env:SB_BUILD "hipcc"
+          Invoke-Checked cmake -G Ninja -S $src -B $b `
+            "-DCMAKE_BUILD_TYPE=Release" `
+            "-DCMAKE_INSTALL_PREFIX=$(Convert-Fwd $env:SB_SDK)" `
+            "-DCMAKE_PREFIX_PATH=$(Get-PrefixPath)" `
+            "-DCMAKE_C_COMPILER=cl.exe" `
+            "-DCMAKE_CXX_COMPILER=cl.exe" `
+            "-DCMAKE_LINKER=link.exe" `
+            "-DCMAKE_C_COMPILER_LAUNCHER=sccache" `
+            "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache" `
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" `
+            "-DHIPCC_BACKWARD_COMPATIBILITY=OFF"
+          Invoke-Checked cmake --build $b
+          Invoke-Checked cmake --install $b
+
+      - name: 3. Build AMDDeviceLibs
+        run: |
+          . (Join-Path $env:SB_ROOT "helpers.ps1")
+          $src = Join-Path $env:SB_SRC "llvm-project\amd\device-libs"
+          $b = Join-Path $env:SB_BUILD "device-libs"
+          $sdk = Convert-Fwd $env:SB_SDK
+          Invoke-Checked cmake -G Ninja -S $src -B $b `
+            "-DCMAKE_BUILD_TYPE=Release" `
+            "-DCMAKE_INSTALL_PREFIX=$sdk" `
+            "-DCMAKE_PREFIX_PATH=$(Get-PrefixPath)" `
+            "-DLLVM_DIR=$sdk/lib/cmake/llvm" `
+            "-DClang_DIR=$sdk/lib/cmake/clang"
+          Invoke-Checked cmake --build $b
+          Invoke-Checked cmake --install $b
+
+      - name: 4. Build amd-comgr
+        timeout-minutes: 120
+        run: |
+          . (Join-Path $env:SB_ROOT "helpers.ps1")
+          $src = Join-Path $env:SB_SRC "llvm-project\amd\comgr"
+          $b = Join-Path $env:SB_BUILD "comgr"
+          $sdk = Convert-Fwd $env:SB_SDK
+          # comgr defaults to an unsuffixed DLL. Derive the same suffix clr
+          # derives for hiprtc, from the same file, and export it: rocclr bakes
+          # this exact name in and LoadLibrary's it at runtime, so the comgr
+          # build and the clr build have to agree on it.
+          $verFile = Join-Path $env:SB_SRC "rocm-systems\projects\hip\VERSION"
+          $nums = @(Get-Content $verFile | Where-Object { $_ -match '^\d+$' })
+          if ($nums.Count -lt 2) {
+            Write-Error "cannot read the HIP version from $verFile"
+            exit 1
+          }
+          $comgrDll = "amd_comgr{0:D2}{1:D2}.dll" -f [int]$nums[0], [int]$nums[1]
+          Write-Host "comgr DLL name: $comgrDll"
+          "COMGR_DLL=$comgrDll" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Invoke-Checked cmake -G Ninja -S $src -B $b `
+            "-DCMAKE_BUILD_TYPE=Release" `
+            "-DCMAKE_INSTALL_PREFIX=$sdk" `
+            "-DCMAKE_PREFIX_PATH=$(Get-PrefixPath)" `
+            "-DCMAKE_C_COMPILER=cl.exe" `
+            "-DCMAKE_CXX_COMPILER=cl.exe" `
+            "-DCMAKE_LINKER=link.exe" `
+            "-DCMAKE_C_COMPILER_LAUNCHER=sccache" `
+            "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache" `
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" `
+            "-DCOMGR_USE_MSVC_STATIC_RUNTIME=ON" `
+            "-DCOMGR_STATIC_LLVM=ON" `
+            "-DCOMGR_DISABLE_SPIRV=ON" `
+            "-DCOMGR_DLL_NAME=$comgrDll" `
+            "-DLLVM_VERSION_SUFFIX=-rocm7" `
+            "-DZLIB_USE_STATIC_LIBS=ON" `
+            "-DBUILD_TESTING=OFF" `
+            "-DLLVM_DIR=$sdk/lib/cmake/llvm" `
+            "-DClang_DIR=$sdk/lib/cmake/clang" `
+            "-DLLD_DIR=$sdk/lib/cmake/lld" `
+            "-DAMDDeviceLibs_DIR=$sdk/lib/cmake/AMDDeviceLibs"
+          Invoke-Checked cmake --build $b
+          Invoke-Checked cmake --install $b
+
+      - name: 5. Build hip-clr
+        timeout-minutes: 90
+        run: |
+          . (Join-Path $env:SB_ROOT "helpers.ps1")
+          $src = Join-Path $env:SB_SRC "rocm-systems\projects\clr"
+          $hip = Convert-Fwd (Join-Path $env:SB_SRC "rocm-systems\projects\hip")
+          $pal = Convert-Fwd (Join-Path $env:SB_SRC "rocm-systems\shared\amdgpu-windows-interop")
+          $b = Join-Path $env:SB_BUILD "clr"
+          $sdk = Convert-Fwd $env:SB_SDK
+          $gpu = $env:GPU_ARCHS
+          Invoke-Checked cmake -G Ninja -S $src -B $b `
+            "-DCMAKE_BUILD_TYPE=Release" `
+            "-DCMAKE_INSTALL_PREFIX=$sdk" `
+            "-DCMAKE_PREFIX_PATH=$(Get-PrefixPath)" `
+            "-DCMAKE_C_COMPILER=cl.exe" `
+            "-DCMAKE_CXX_COMPILER=cl.exe" `
+            "-DCMAKE_LINKER=link.exe" `
+            "-DCMAKE_C_COMPILER_LAUNCHER=sccache" `
+            "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache" `
+            "-DHIP_PLATFORM=amd" `
+            "-DHIP_COMMON_DIR=$hip" `
+            "-DCLR_BUILD_HIP=ON" `
+            "-DROCM_KPACK_ENABLED=OFF" `
+            "-DHIPCC_BIN_DIR=" `
+            "-DUSE_PROF_API=OFF" `
+            "-D__HIP_ENABLE_PCH=OFF" `
+            "-DROCCLR_ENABLE_PAL=1" `
+            "-DROCCLR_ENABLE_HSA=1" `
+            "-D__HIP_ENABLE_RTC=1" `
+            "-DROCR_DLL_LOAD=0" `
+            "-DCOMGR_DLL_NAME=$env:COMGR_DLL" `
+            "-DAMD_COMPUTE_WIN=$pal" `
+            "-DAMDGPU_TARGETS=$gpu" `
+            "-DGPU_TARGETS=$gpu" `
+            "-DZLIB_USE_STATIC_LIBS=ON" `
+            "-DBUILD_TESTING=OFF"
+          Invoke-Checked cmake --build $b
+          Invoke-Checked cmake --install $b
+          $libdir = Join-Path $env:SB_SDK "lib"
+          $legacy = Join-Path $libdir "amdhip64.lib"
+          if (-not (Test-Path $legacy)) {
+            $ver = @(Get-ChildItem $libdir -Filter "amdhip64_*.lib" -ErrorAction SilentlyContinue)
+            if ($ver.Count -ge 1) { Copy-Item $ver[0].FullName $legacy }
+          }
+          # hipamd's install REMOVE_RECURSEs the prefix include dir on Windows,
+          # taking amd_comgr's header with it. Its lib/cmake export survives, so
+          # only the headers need restoring, and stinkytofu needs them.
+          Invoke-Checked cmake --install (Join-Path $env:SB_BUILD "comgr")
+          if (-not (Test-Path (Join-Path $env:SB_SDK "include\amd_comgr\amd_comgr.h"))) {
+            Write-Error "amd_comgr.h missing after restoring the comgr install"
+            exit 1
+          }
+
+      - name: 6. Build hipBLASLt
+        timeout-minutes: 180
+        run: |
+          . (Join-Path $env:SB_ROOT "helpers.ps1")
+          # Tensile drives clang directly for most of this step, so sccache sees
+          # no requests, its server reaches the idle timeout and the counters
+          # reset. Report what the five earlier steps achieved before that.
+          sccache --show-stats
+          $libs = Join-Path $env:SB_SRC "rocm-libraries"
+          $sdk = Convert-Fwd $env:SB_SDK
+          $prefix = Get-PrefixPath
+          $gpu = $env:GPU_ARCHS
+          $commonSrc = Join-Path $libs "projects\hipblas-common"
+          $cb = Join-Path $env:SB_BUILD "hipblas-common"
+          Invoke-Checked cmake -G Ninja -S $commonSrc -B $cb `
+            "-DCMAKE_BUILD_TYPE=Release" `
+            "-DCMAKE_INSTALL_PREFIX=$sdk" `
+            "-DCMAKE_PREFIX_PATH=$prefix" `
+            "-DCMAKE_C_COMPILER=cl.exe" `
+            "-DCMAKE_CXX_COMPILER=cl.exe" `
+            "-DCMAKE_LINKER=link.exe" `
+            "-DBUILD_TESTING=OFF"
+          Invoke-Checked cmake --build $cb
+          Invoke-Checked cmake --install $cb
+
+          $logicSrc = Join-Path $libs "projects\hipblaslt\library\src\amd_detail\rocblaslt\src\Tensile\Logic\asm_full"
+          $keepRoot = Join-Path $env:SB_BUILD "logic-keep\library"
+          if (Test-Path $keepRoot) { Remove-Item -Recurse -Force $keepRoot }
+          $keepAsm = Join-Path $keepRoot "src\amd_detail\rocblaslt\src\Tensile\Logic\asm_full"
+          $stems115 = @(
+            "Cijk_Ailk_Bljk_HHS_BH_Bias_HAS_SAV_UserArgs",
+            "Cijk_Alik_Bljk_HHS_BH_Bias_HAS_SAV_UserArgs",
+            "Cijk_Ailk_Bljk_HSS_BH_Bias_HAS_SAV_UserArgs",
+            "Cijk_Alik_Bljk_HSS_BH_Bias_HAS_SAV_UserArgs",
+            "Cijk_Alik_Bljk_HSS_BH_Bias_HAH",
+            "Cijk_Ailk_Bljk_S_B_Bias_HAS_SAV_UserArgs",
+            "Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV_UserArgs"
+          )
+          $stems117 = @(
+            "Cijk_Ailk_Bljk_HHS_BH_Bias_SHB_HA_S_SAB_SCD_SAV_UserArgs",
+            "Cijk_Alik_Bljk_HHS_BH_Bias_SHB_HA_S_SAB_SCD_SAV_UserArgs",
+            "Cijk_Ailk_Bljk_HSS_BH_Bias_SHB_HA_S_SAB_SCD_SAV_UserArgs",
+            "Cijk_Alik_Bljk_HSS_BH_Bias_SHB_HA_S_SAB_SCD_SAV_UserArgs"
+          )
+          $copied = 0
+          foreach ($arch in @("gfx1150", "gfx1151", "gfx1152", "gfx1153")) {
+            $from = Join-Path (Join-Path $logicSrc $arch) "GridBased"
+            $to = Join-Path (Join-Path $keepAsm $arch) "GridBased"
+            New-Item -ItemType Directory -Force -Path $to | Out-Null
+            foreach ($s in $stems115) {
+              $p = Join-Path $from ($arch + "_" + $s + ".yaml")
+              if (Test-Path $p) { Copy-Item $p $to; $copied++ }
+            }
+          }
+          foreach ($arch in @("gfx1170")) {
+            $from = Join-Path (Join-Path $logicSrc $arch) "GridBased"
+            $to = Join-Path (Join-Path $keepAsm $arch) "GridBased"
+            New-Item -ItemType Directory -Force -Path $to | Out-Null
+            foreach ($s in $stems117) {
+              $p = Join-Path $from ($arch + "_" + $s + ".yaml")
+              if (Test-Path $p) { Copy-Item $p $to; $copied++ }
+            }
+          }
+          Write-Host "copied $copied keep-set yaml files"
+          if ($copied -lt 1) { Write-Error "keep-set copy produced no yaml"; exit 1 }
+
+          $venv = Join-Path $env:SB_ROOT "venv-hipblaslt"
+          $py = Join-Path $venv "Scripts\python.exe"
+          if (-not (Test-Path $py)) {
+            python -m venv $venv
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          & $py -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -m pip install packaging pyyaml msgpack "joblib>=1.4.0" numpy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $clang = Join-Path $env:SB_SDK "bin\clang.exe"
+          $clangxx = Join-Path $env:SB_SDK "bin\clang++.exe"
+          if (-not (Test-Path $clangxx)) { $clangxx = $clang }
+          $lld = Join-Path $env:SB_SDK "bin\lld.exe"
+          $env:HIP_PATH = $env:SB_SDK
+          $env:HIP_CLANG_PATH = Join-Path $env:SB_SDK "bin"
+          $hbSrc = Join-Path $libs "projects\hipblaslt"
+          $hb = Join-Path $env:SB_BUILD "hipblaslt"
+          $keep = Convert-Fwd $keepRoot
+          # minwindef's max() macro breaks numeric_limits::max() in the HIP fp8
+          # and Tensile headers. hipBLASLt's tasks.py also passes --rocm-path,
+          # which cannot be used here: stinkytofu builds its host tools with
+          # -Werror and clang reports the flag unused on non-HIP translation
+          # units. The flat layout lets clang derive the ROCm root from its own
+          # path instead.
+          Invoke-Checked cmake -G Ninja -S $hbSrc -B $hb `
+            "-DCMAKE_BUILD_TYPE=Release" `
+            "-DCMAKE_INSTALL_PREFIX=$sdk" `
+            "-DCMAKE_PREFIX_PATH=$prefix" `
+            "-DCMAKE_C_COMPILER=$(Convert-Fwd $clang)" `
+            "-DCMAKE_CXX_COMPILER=$(Convert-Fwd $clangxx)" `
+            "-DCMAKE_LINKER=$(Convert-Fwd $lld)" `
+            "-DCMAKE_C_COMPILER_LAUNCHER=sccache" `
+            "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache" `
+            "-DCMAKE_CXX_FLAGS=-DNOMINMAX" `
+            "-DCMAKE_POLICY_VERSION_MINIMUM=3.10" `
+            "-DHIP_PLATFORM=amd" `
+            "-DGPU_TARGETS=$gpu" `
+            "-DAMDGPU_TARGETS=$gpu" `
+            "-DCMAKE_HIP_ARCHITECTURES=$gpu" `
+            "-DHIPBLASLT_ENABLE_CLIENT=OFF" `
+            "-DHIPBLASLT_BUILD_TESTING=OFF" `
+            "-DHIPBLASLT_ENABLE_ROCROLLER=OFF" `
+            "-DHIPBLASLT_ENABLE_AMD_SMI=OFF" `
+            "-DHIPBLASLT_ENABLE_BLIS=OFF" `
+            "-DHIPBLASLT_ENABLE_FETCH=ON" `
+            "-DTENSILELITE_BUILD_TESTING=OFF" `
+            "-DTENSILELITE_ENABLE_CLIENT=OFF" `
+            "-DTENSILELITE_BUILD_PARALLEL_LEVEL=4" `
+            "-DROCISA_USE_STABLE_ABI=ON" `
+            "-DHIPBLASLT_LIBLOGIC_PATH=$keep" `
+            "-DTENSILELITE_LOGIC_FILTER=*" `
+            "-DPython3_EXECUTABLE=$(Convert-Fwd $py)" `
+            "-DPython_EXECUTABLE=$(Convert-Fwd $py)" `
+            "-DZLIB_USE_STATIC_LIBS=ON"
+          Invoke-Checked cmake --build $hb
+          Invoke-Checked cmake --install $hb
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
+      - name: Verify and trim SDK
+        run: |
+          $dist = $env:SB_SDK
+          $required = @(
+            "bin\clang.exe",
+            "bin\lld.exe",
+            "bin\clang-offload-bundler.exe",
+            "bin\amdgpu-arch.exe",
+            "amdgcn\bitcode",
+            "lib\clang",
+            "include\amd_comgr\amd_comgr.h",
+            "bin\hipblaslt.dll",
+            "bin\hipblaslt\library\gfx1151",
+            "lib\cmake\hip\hip-config.cmake",
+            "lib\cmake\hipblaslt"
+          )
+          $missing = @($required | Where-Object { -not (Test-Path (Join-Path $dist $_)) })
+          if (-not (Get-ChildItem (Join-Path $dist "bin") -Filter "hipcc*" -ErrorAction SilentlyContinue)) {
+            $missing += "bin\hipcc*"
+          }
+          if (-not (Get-ChildItem (Join-Path $dist "bin") -Filter "amdhip64*.dll" -ErrorAction SilentlyContinue)) {
+            $missing += "bin\amdhip64*.dll"
+          }
+          if (-not (Get-ChildItem (Join-Path $dist "bin") -Filter "hiprtc*.dll" -ErrorAction SilentlyContinue)) {
+            $missing += "bin\hiprtc*.dll"
+          }
+          if (-not (Get-ChildItem (Join-Path $dist "bin") -Filter "amd_comgr*.dll" -ErrorAction SilentlyContinue)) {
+            $missing += "bin\amd_comgr*.dll"
+          }
+          if ($missing.Count -gt 0) {
+            $missing | ForEach-Object { Write-Host "MISSING: $_" }
+            exit 1
+          }
+
+          $keepExe = @(
+            "clang.exe", "clang++.exe", "lld.exe", "lld-link.exe",
+            "llvm-objcopy.exe", "clang-offload-bundler.exe", "amdgpu-arch.exe"
+          )
+          Get-ChildItem (Join-Path $dist "bin") -File -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Extension -eq ".exe" -and
+              $keepExe -notcontains $_.Name -and
+              $_.Name -notlike "hipcc*" -and
+              $_.Name -notlike "hipconfig*"
+            } |
+            ForEach-Object { Remove-Item $_.FullName -Force }
+          Get-ChildItem (Join-Path $dist "lib") -Filter "*.lib" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch '^(amd_comgr|amdhip64|hipblaslt|hiprtc)' } |
+            ForEach-Object { Remove-Item $_.FullName -Force }
+          # A full LLVM install also drops libclang, LTO and Remarks into bin;
+          # none of them are consumed and together they are over 150 MB. Match by
+          # pattern because the runtime DLLs carry ROCm version suffixes.
+          $keepBinDll = @("amd_comgr*.dll", "amdhip64_*.dll", "hipblaslt.dll", "hiprtc*.dll")
+          Get-ChildItem (Join-Path $dist "bin") -Filter "*.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $n = $_.Name; -not ($keepBinDll | Where-Object { $n -like $_ }) } |
+            ForEach-Object { Remove-Item $_.FullName -Force }
+
+          foreach ($p in @("amdhip64*.dll", "amd_comgr*.dll", "hiprtc*.dll", "hipblaslt.dll")) {
+            if (-not (Get-ChildItem (Join-Path $dist "bin") -Filter $p -ErrorAction SilentlyContinue)) {
+              Write-Host "MISSING after trim: bin\$p"
+              exit 1
+            }
+          }
+          $full = $false
+          $libRoot = Join-Path $dist "bin\hipblaslt\library"
+          foreach ($d in Get-ChildItem $libRoot -Directory -ErrorAction SilentlyContinue) {
+            $co = @(Get-ChildItem $d.FullName -Filter "*.co" -ErrorAction SilentlyContinue).Count
+            Write-Host "hipBLASLt logic: $($d.Name) ($co .co)"
+            if ($co -gt 20) { $full = $true }
+          }
+          if ($full) {
+            Write-Host "hipBLASLt keep-set was overwritten by the full Tensile set"
+            exit 1
+          }
+
+          # A compressed offload bundle starts with CCOB and carries a u16
+          # compression method at offset 6, where 1 is zstd and 0 the zlib
+          # fallback. extop_*.co is written without the bundler, so only the
+          # Tensile objects are bundles.
+          $notZstd = @()
+          foreach ($f in Get-ChildItem $libRoot -Recurse -Filter "TensileLibrary_*.co" -ErrorAction SilentlyContinue) {
+            $head = [System.IO.File]::ReadAllBytes($f.FullName)
+            if ($head.Length -lt 8 -or [System.Text.Encoding]::ASCII.GetString($head, 0, 4) -ne "CCOB") {
+              $notZstd += "$($f.Name): not a compressed bundle"
+              continue
+            }
+            $method = [System.BitConverter]::ToUInt16($head, 6)
+            if ($method -ne 1) { $notZstd += "$($f.Name): compression method $method" }
+          }
+          if ($notZstd.Count -gt 0) {
+            $notZstd | ForEach-Object { Write-Host "NOT ZSTD: $_" }
+            exit 1
+          }
+
+      - name: Pack SDK tarball
+        id: pack
+        run: |
+          $verFile = Join-Path $env:SB_SRC "rocm-systems\projects\hip\VERSION"
+          $nums = @(Get-Content $verFile | Where-Object { $_ -match '^\d+$' })
+          if ($nums.Count -lt 3) {
+            Write-Error "cannot read the HIP version from $verFile"
+            exit 1
+          }
+          $ver = "{0}.{1}.{2}" -f [int]$nums[0], [int]$nums[1], [int]$nums[2]
+          $name = "rocm-dist-windows-$env:DIST_ARCH_TAG-$ver-$env:DIST_VARIANT"
+          "name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $out = Join-Path $env:SB_ROOT "$name.tar.gz"
+          if (Test-Path $out) { Remove-Item -Force $out }
+          # cmake/deps.cmake fetches one .tar.gz and unpacks it with
+          # --strip-components=1, so the archive carries a single top-level dir.
+          tar -czf $out -C $env:SB_ROOT rocm
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host ("{0}.tar.gz = {1:N1} MB" -f $name, ((Get-Item $out).Length / 1MB))
+          "tarball=$($out -replace '\\', '/')" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: ${{ steps.pack.outputs.tarball }}
+          retention-days: 7
+          if-no-files-found: error
+          # The payload is already gzipped; re-zipping it only costs time.
+          compression-level: 0

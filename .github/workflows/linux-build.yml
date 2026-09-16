@@ -41,6 +41,7 @@ env:
 
 jobs:
   build-linux:
+    if: github.repository == 'ROCm/hip-ep'
     # No draft-PR gate: the cache-priming strategy needs every PR push.
     runs-on: ubuntu-latest
     steps:
