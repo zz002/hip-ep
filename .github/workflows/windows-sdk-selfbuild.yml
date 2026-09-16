@@ -34,7 +34,7 @@ env:
   # Tarball name follows cmake/deps.txt: <what>-dist-windows-<archs>-<version>-<variant>.
   # The version comes from the HIP source tree, these two describe this build.
   DIST_ARCH_TAG: gfx115x-gfx1170
-  DIST_VARIANT: hipblaslt-trimmed
+  DIST_VARIANT: hipblaslt-gfx1170-trimmed
   GPU_ARCHS: gfx1150;gfx1151;gfx1152;gfx1153;gfx1170
 
 jobs:
@@ -551,15 +551,6 @@ jobs:
           $keepRoot = Join-Path $env:SB_BUILD "logic-keep\library"
           if (Test-Path $keepRoot) { Remove-Item -Recurse -Force $keepRoot }
           $keepAsm = Join-Path $keepRoot "src\amd_detail\rocblaslt\src\Tensile\Logic\asm_full"
-          $stems115 = @(
-            "Cijk_Ailk_Bljk_HHS_BH_Bias_HAS_SAV_UserArgs",
-            "Cijk_Alik_Bljk_HHS_BH_Bias_HAS_SAV_UserArgs",
-            "Cijk_Ailk_Bljk_HSS_BH_Bias_HAS_SAV_UserArgs",
-            "Cijk_Alik_Bljk_HSS_BH_Bias_HAS_SAV_UserArgs",
-            "Cijk_Alik_Bljk_HSS_BH_Bias_HAH",
-            "Cijk_Ailk_Bljk_S_B_Bias_HAS_SAV_UserArgs",
-            "Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV_UserArgs"
-          )
           $stems117 = @(
             "Cijk_Ailk_Bljk_HHS_BH_Bias_SHB_HA_S_SAB_SCD_SAV_UserArgs",
             "Cijk_Alik_Bljk_HHS_BH_Bias_SHB_HA_S_SAB_SCD_SAV_UserArgs",
@@ -567,14 +558,13 @@ jobs:
             "Cijk_Alik_Bljk_HSS_BH_Bias_SHB_HA_S_SAB_SCD_SAV_UserArgs"
           )
           $copied = 0
+          # gfx115x ships its full logic set (both Equality and GridBased); only
+          # gfx1170 is trimmed to the stems the workloads dispatch.
+          New-Item -ItemType Directory -Force -Path $keepAsm | Out-Null
           foreach ($arch in @("gfx1150", "gfx1151", "gfx1152", "gfx1153")) {
-            $from = Join-Path (Join-Path $logicSrc $arch) "GridBased"
-            $to = Join-Path (Join-Path $keepAsm $arch) "GridBased"
-            New-Item -ItemType Directory -Force -Path $to | Out-Null
-            foreach ($s in $stems115) {
-              $p = Join-Path $from ($arch + "_" + $s + ".yaml")
-              if (Test-Path $p) { Copy-Item $p $to; $copied++ }
-            }
+            $to = Join-Path $keepAsm $arch
+            Copy-Item -Recurse (Join-Path $logicSrc $arch) $to
+            $copied += @(Get-ChildItem $to -Recurse -Filter *.yaml).Count
           }
           foreach ($arch in @("gfx1170")) {
             $from = Join-Path (Join-Path $logicSrc $arch) "GridBased"
@@ -714,15 +704,22 @@ jobs:
               exit 1
             }
           }
-          $full = $false
+          $bad = @()
           $libRoot = Join-Path $dist "bin\hipblaslt\library"
           foreach ($d in Get-ChildItem $libRoot -Directory -ErrorAction SilentlyContinue) {
             $co = @(Get-ChildItem $d.FullName -Filter "*.co" -ErrorAction SilentlyContinue).Count
             Write-Host "hipBLASLt logic: $($d.Name) ($co .co)"
-            if ($co -gt 20) { $full = $true }
+            # gfx1170 is the only trimmed arch, so each side is checked against
+            # the opposite failure: a trim that silently went full, or a full set
+            # that silently got trimmed.
+            if ($d.Name -eq "gfx1170") {
+              if ($co -gt 20) { $bad += "$($d.Name): expected the trimmed set, got $co .co" }
+            } elseif ($co -le 20) {
+              $bad += "$($d.Name): expected the full set, got only $co .co"
+            }
           }
-          if ($full) {
-            Write-Host "hipBLASLt keep-set was overwritten by the full Tensile set"
+          if ($bad.Count -gt 0) {
+            $bad | ForEach-Object { Write-Host $_ }
             exit 1
           }
 
