@@ -675,10 +675,25 @@ jobs:
             exit 1
           }
 
+      - name: Pack SDK tarball
+        id: pack
+        run: |
+          $name = "${{ steps.meta.outputs.value }}"
+          $out = Join-Path $env:SB_ROOT "$name.tar.gz"
+          if (Test-Path $out) { Remove-Item -Force $out }
+          # cmake/deps.cmake fetches one .tar.gz and unpacks it with
+          # --strip-components=1, so the archive carries a single top-level dir.
+          tar -czf $out -C $env:SB_ROOT rocm
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host ("{0}.tar.gz = {1:N1} MB" -f $name, ((Get-Item $out).Length / 1MB))
+          "tarball=$($out -replace '\\', '/')" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
       - name: Upload SDK artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.value }}
-          path: ${{ steps.paths.outputs.sdk }}
+          path: ${{ steps.pack.outputs.tarball }}
           retention-days: 7
           if-no-files-found: error
+          # The payload is already gzipped; re-zipping it only costs time.
+          compression-level: 0
