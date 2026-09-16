@@ -15,6 +15,12 @@ on:
         required: false
         type: string
         default: "1"
+      clean:
+        description: "Reclaim runner disk before building: none, build (drop build trees and the SDK prefix, keep clones), all (drop the whole sdk-selfbuild tree). The sccache dir self-evicts at its size cap."
+        required: false
+        type: choice
+        default: none
+        options: [none, build, all]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
@@ -86,6 +92,8 @@ jobs:
 
       - name: Prepare workspace
         id: paths
+        env:
+          CLEAN: ${{ inputs.clean || 'none' }}
         run: |
           $ws = Split-Path "${{ github.workspace }}" -Parent
           $root = Join-Path $ws "sdk-selfbuild"
@@ -93,6 +101,25 @@ jobs:
           $src = Join-Path $root "src"
           $build = Join-Path $root "build"
           $tp = Join-Path $root "thirdparty"
+          # This tree is deliberately persistent so from_step can resume, which
+          # also means nothing reclaims it until asked.
+          switch ($env:CLEAN) {
+            "all" {
+              if (Test-Path $root) {
+                Write-Host "removing $root"
+                Remove-Item -Recurse -Force $root
+              }
+            }
+            "build" {
+              foreach ($d in @($build, $sdk)) {
+                if (Test-Path $d) {
+                  Write-Host "removing $d"
+                  Remove-Item -Recurse -Force $d
+                }
+              }
+            }
+            default { }
+          }
           @(
             "SB_ROOT=$root",
             "SB_SDK=$sdk",
@@ -208,8 +235,9 @@ jobs:
           $stats = sccache --show-stats 2>&1 | Out-String
           Write-Host $stats
           # An already-running server keeps its original location, so assert the
-          # move instead of trusting the env vars.
-          if ($stats -notmatch [regex]::Escape($dir)) {
+          # move instead of trusting the env vars. sccache prints the path with
+          # escaped separators, hence the unescaping before the match.
+          if (($stats -replace '\\\\', '\') -notmatch [regex]::Escape($dir)) {
             Write-Error "sccache cache location is not $dir"
             exit 1
           }
