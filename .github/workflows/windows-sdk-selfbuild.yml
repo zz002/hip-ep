@@ -34,7 +34,7 @@ env:
   # Tarball name follows cmake/deps.txt: <what>-dist-windows-<archs>-<version>-<variant>.
   # The version comes from the HIP source tree, these two describe this build.
   DIST_ARCH_TAG: gfx115x-gfx1170
-  DIST_VARIANT: hipblaslt-trimmed
+  DIST_VARIANT: hipblaslt-gfx1170-trimmed
   GPU_ARCHS: gfx1150;gfx1151;gfx1152;gfx1153;gfx1170
 
 jobs:
