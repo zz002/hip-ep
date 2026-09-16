@@ -41,12 +41,13 @@ jobs:
     runs-on: strix_build
     timeout-minutes: 600
     concurrency:
-      # One build at a time: every run uses the same prefix and build trees
-      # under runner.workspace, so two of them would corrupt each other. The
-      # group deliberately spans branches. Superseding the running build beats
-      # queueing behind it, because a group keeps only one pending run and the
-      # next push would cancel it anyway.
-      group: sdk-selfbuild-${{ github.repository }}
+      # Per-branch, so stacked PRs never cancel each other; a group keeps only
+      # one pending run, so a shared group made every second push discard a
+      # queued build. Builds still serialize because strix_build is a single
+      # runner, and every run shares one prefix and build tree under
+      # runner.workspace: a second runner carrying this label would need
+      # per-branch working directories before it could be used.
+      group: sdk-selfbuild-${{ github.repository }}-${{ github.ref }}
       cancel-in-progress: true
     defaults:
       run:
