@@ -29,6 +29,10 @@ env:
   ZLIB_SHA256: bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16
   MSGPACK_URL: https://rocm-third-party-deps.s3.us-east-2.amazonaws.com/msgpack-cxx-7.0.0.tar.gz
   MSGPACK_SHA256: 7504b7af7e7b9002ce529d4f941e1b7fb1fb435768780ce7da4abaac79bb156f
+  # Tarball name follows cmake/deps.txt: <what>-dist-windows-<archs>-<version>-<variant>.
+  # The version comes from the HIP source tree, these two describe this build.
+  DIST_ARCH_TAG: gfx115x-gfx1170
+  DIST_VARIANT: hipblaslt-trimmed
   GPU_ARCHS: gfx1150;gfx1151;gfx1152;gfx1153;gfx1170
 
 jobs:
@@ -64,14 +68,6 @@ jobs:
           Write-Host "::add-mask::$token"
           "token=$token" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           gh auth setup-git
-
-      - name: Record artifact name
-        id: meta
-        run: |
-          $short = $env:LLVM_PIN.Substring(0, 12)
-          $name = "windows-sdk-selfbuild-$short-gfx115x-gfx1170"
-          "value=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          Write-Host "artifact: $name"
 
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
@@ -693,7 +689,15 @@ jobs:
       - name: Pack SDK tarball
         id: pack
         run: |
-          $name = "${{ steps.meta.outputs.value }}"
+          $verFile = Join-Path $env:SB_SRC "rocm-systems\projects\hip\VERSION"
+          $nums = @(Get-Content $verFile | Where-Object { $_ -match '^\d+$' })
+          if ($nums.Count -lt 3) {
+            Write-Error "cannot read the HIP version from $verFile"
+            exit 1
+          }
+          $ver = "{0}.{1}.{2}" -f [int]$nums[0], [int]$nums[1], [int]$nums[2]
+          $name = "rocm-dist-windows-$env:DIST_ARCH_TAG-$ver-$env:DIST_VARIANT"
+          "name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           $out = Join-Path $env:SB_ROOT "$name.tar.gz"
           if (Test-Path $out) { Remove-Item -Force $out }
           # cmake/deps.cmake fetches one .tar.gz and unpacks it with
@@ -706,7 +710,7 @@ jobs:
       - name: Upload SDK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.meta.outputs.value }}
+          name: ${{ steps.pack.outputs.name }}
           path: ${{ steps.pack.outputs.tarball }}
           retention-days: 7
           if-no-files-found: error
