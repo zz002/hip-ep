@@ -553,9 +553,12 @@ jobs:
           $hbSrc = Join-Path $libs "projects\hipblaslt"
           $hb = Join-Path $env:SB_BUILD "hipblaslt"
           $keep = Convert-Fwd $keepRoot
-          # Both CXX flags mirror hipBLASLt's own tasks.py on Windows: NOMINMAX
-          # because minwindef's max() macro breaks numeric_limits::max(), and
-          # --rocm-path because amdclang++ does not read ROCM_PATH there.
+          # minwindef's max() macro breaks numeric_limits::max() in the HIP fp8
+          # and Tensile headers. hipBLASLt's tasks.py also passes --rocm-path,
+          # which cannot be used here: stinkytofu builds its host tools with
+          # -Werror and clang reports the flag unused on non-HIP translation
+          # units. The flat layout lets clang derive the ROCm root from its own
+          # path instead.
           Invoke-Checked cmake -G Ninja -S $hbSrc -B $hb `
             "-DCMAKE_BUILD_TYPE=Release" `
             "-DCMAKE_INSTALL_PREFIX=$sdk" `
@@ -565,7 +568,7 @@ jobs:
             "-DCMAKE_LINKER=$(Convert-Fwd $lld)" `
             "-DCMAKE_C_COMPILER_LAUNCHER=sccache" `
             "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache" `
-            "-DCMAKE_CXX_FLAGS=-DNOMINMAX --rocm-path=$sdk" `
+            "-DCMAKE_CXX_FLAGS=-DNOMINMAX" `
             "-DCMAKE_POLICY_VERSION_MINIMUM=3.10" `
             "-DHIP_PLATFORM=amd" `
             "-DGPU_TARGETS=$gpu" `
