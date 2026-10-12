@@ -688,21 +688,33 @@ jobs:
             } |
             ForEach-Object { Remove-Item $_.FullName -Force }
           Get-ChildItem (Join-Path $dist "lib") -Filter "*.lib" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -notmatch '^(amd_comgr|amdhip64|hipblaslt|hiprtc)' } |
+            Where-Object { $_.Name -notmatch '^(amd_comgr|amdhip64|hipblaslt|hiprtc|origami|tensilelite-host)' } |
             ForEach-Object { Remove-Item $_.FullName -Force }
           # A full LLVM install also drops libclang, LTO and Remarks into bin;
           # none of them are consumed and together they are over 150 MB. Match by
           # pattern because the runtime DLLs carry ROCm version suffixes.
-          $keepBinDll = @("amd_comgr*.dll", "amdhip64_*.dll", "hipblaslt.dll", "hiprtc*.dll")
+          $keepBinDll = @("amd_comgr*.dll", "amdhip64_*.dll", "hipblaslt.dll", "hiprtc*.dll", "tensilelite-host.dll")
           Get-ChildItem (Join-Path $dist "bin") -Filter "*.dll" -ErrorAction SilentlyContinue |
             Where-Object { $n = $_.Name; -not ($keepBinDll | Where-Object { $n -like $_ }) } |
             ForEach-Object { Remove-Item $_.FullName -Force }
 
-          foreach ($p in @("amdhip64*.dll", "amd_comgr*.dll", "hiprtc*.dll", "hipblaslt.dll")) {
+          foreach ($p in @("amdhip64*.dll", "amd_comgr*.dll", "hiprtc*.dll", "hipblaslt.dll", "tensilelite-host.dll")) {
             if (-not (Get-ChildItem (Join-Path $dist "bin") -Filter $p -ErrorAction SilentlyContinue)) {
               Write-Host "MISSING after trim: bin\$p"
               exit 1
             }
+          }
+          $danglingImports = @()
+          foreach ($f in Get-ChildItem (Join-Path $dist "lib\cmake") -Recurse -Filter "*-targets-*.cmake" -ErrorAction SilentlyContinue) {
+            foreach ($m in [regex]::Matches((Get-Content -Raw $f.FullName), 'IMPORTED_(?:LOCATION|IMPLIB)\w*\s+"\$\{_IMPORT_PREFIX\}/([^"]+)"')) {
+              if (-not (Test-Path (Join-Path $dist $m.Groups[1].Value))) {
+                $danglingImports += "$($f.Name): $($m.Groups[1].Value)"
+              }
+            }
+          }
+          if ($danglingImports.Count -gt 0) {
+            $danglingImports | ForEach-Object { Write-Host "MISSING imported file after trim: $_" }
+            exit 1
           }
           $bad = @()
           $libRoot = Join-Path $dist "bin\hipblaslt\library"
