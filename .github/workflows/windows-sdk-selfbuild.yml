@@ -18,13 +18,13 @@ permissions:
 env:
   ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
   LLVM_REPO: https://github.com/ROCm/llvm-project.git
-  LLVM_PIN: 2904a87d4ddd4d3dd3aaed86fc38c2278b284fd3
+  LLVM_PIN: a2529029ed26084a759360d1cd5ecd9532368007
   ROCM_CMAKE_REPO: https://github.com/ROCm/rocm-cmake.git
   ROCM_CMAKE_PIN: 10155d7272ea1bf79f6b5a9dbc339657af1aa372
   ROCM_SYSTEMS_REPO: https://github.com/AMD-ROCm-Internal/rocm-systems.git
-  ROCM_SYSTEMS_PIN: b0bc2cc5fd3f9c296336612764df5edbf0a0f205
+  ROCM_SYSTEMS_PIN: 4eff437a46d09be86b0581105472dc079b2c30f4
   ROCM_LIBRARIES_REPO: https://github.com/AMD-ROCm-Internal/rocm-libraries.git
-  ROCM_LIBRARIES_PIN: c37db3c207f8ef558590900bdd575a48df3b356c
+  ROCM_LIBRARIES_PIN: d0b176ed282e123b4a57f9b7709836ad8c9609df
   ZLIB_URL: https://rocm-third-party-deps.s3.us-east-2.amazonaws.com/zlib-1.3.2.tar.gz
   ZLIB_SHA256: bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16
   ZSTD_URL: https://rocm-third-party-deps.s3.us-east-2.amazonaws.com/zstd-1.5.7.tar.gz
@@ -329,7 +329,7 @@ jobs:
           $b = Join-Path $env:SB_BUILD "llvm"
           $prefix = Get-PrefixPath
           $sdk = Convert-Fwd $env:SB_SDK
-          $dist = "clang;clang-resource-headers;lld;llvm-objcopy;clang-offload-bundler;offload-arch;llvm-ar;llvm-link;opt;cmake-exports;clang-cmake-exports;lld-cmake-exports;llvm-libraries;clang-libraries;lld-libraries"
+          $dist = "clang;clang-resource-headers;lld;llvm-objcopy;clang-offload-bundler;clang-linker-wrapper;llvm-offload-binary;offload-arch;llvm-ar;llvm-link;opt;cmake-exports;clang-cmake-exports;lld-cmake-exports;llvm-libraries;clang-libraries;lld-libraries"
           $common = @(
             "-G", "Ninja",
             "-S", $src,
@@ -648,6 +648,9 @@ jobs:
             "bin\clang.exe",
             "bin\lld.exe",
             "bin\clang-offload-bundler.exe",
+            "bin\clang-linker-wrapper.exe",
+            "bin\llvm-offload-binary.exe",
+            "bin\ld.lld.exe",
             "bin\amdgpu-arch.exe",
             "amdgcn\bitcode",
             "lib\clang",
@@ -676,8 +679,9 @@ jobs:
           }
 
           $keepExe = @(
-            "clang.exe", "clang++.exe", "lld.exe", "lld-link.exe",
-            "llvm-objcopy.exe", "clang-offload-bundler.exe", "amdgpu-arch.exe"
+            "clang.exe", "clang++.exe", "lld.exe", "lld-link.exe", "ld.lld.exe",
+            "llvm-objcopy.exe", "clang-offload-bundler.exe", "clang-linker-wrapper.exe",
+            "llvm-offload-binary.exe", "amdgpu-arch.exe"
           )
           Get-ChildItem (Join-Path $dist "bin") -File -ErrorAction SilentlyContinue |
             Where-Object {
@@ -688,21 +692,33 @@ jobs:
             } |
             ForEach-Object { Remove-Item $_.FullName -Force }
           Get-ChildItem (Join-Path $dist "lib") -Filter "*.lib" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -notmatch '^(amd_comgr|amdhip64|hipblaslt|hiprtc)' } |
+            Where-Object { $_.Name -notmatch '^(amd_comgr|amdhip64|hipblaslt|hiprtc|origami|tensilelite-host)' } |
             ForEach-Object { Remove-Item $_.FullName -Force }
           # A full LLVM install also drops libclang, LTO and Remarks into bin;
           # none of them are consumed and together they are over 150 MB. Match by
           # pattern because the runtime DLLs carry ROCm version suffixes.
-          $keepBinDll = @("amd_comgr*.dll", "amdhip64_*.dll", "hipblaslt.dll", "hiprtc*.dll")
+          $keepBinDll = @("amd_comgr*.dll", "amdhip64_*.dll", "hipblaslt.dll", "hiprtc*.dll", "tensilelite-host.dll")
           Get-ChildItem (Join-Path $dist "bin") -Filter "*.dll" -ErrorAction SilentlyContinue |
             Where-Object { $n = $_.Name; -not ($keepBinDll | Where-Object { $n -like $_ }) } |
             ForEach-Object { Remove-Item $_.FullName -Force }
 
-          foreach ($p in @("amdhip64*.dll", "amd_comgr*.dll", "hiprtc*.dll", "hipblaslt.dll")) {
+          foreach ($p in @("amdhip64*.dll", "amd_comgr*.dll", "hiprtc*.dll", "hipblaslt.dll", "tensilelite-host.dll")) {
             if (-not (Get-ChildItem (Join-Path $dist "bin") -Filter $p -ErrorAction SilentlyContinue)) {
               Write-Host "MISSING after trim: bin\$p"
               exit 1
             }
+          }
+          $danglingImports = @()
+          foreach ($f in Get-ChildItem (Join-Path $dist "lib\cmake") -Recurse -Filter "*-targets-*.cmake" -ErrorAction SilentlyContinue) {
+            foreach ($m in [regex]::Matches((Get-Content -Raw $f.FullName), 'IMPORTED_(?:LOCATION|IMPLIB)\w*\s+"\$\{_IMPORT_PREFIX\}/([^"]+)"')) {
+              if (-not (Test-Path (Join-Path $dist $m.Groups[1].Value))) {
+                $danglingImports += "$($f.Name): $($m.Groups[1].Value)"
+              }
+            }
+          }
+          if ($danglingImports.Count -gt 0) {
+            $danglingImports | ForEach-Object { Write-Host "MISSING imported file after trim: $_" }
+            exit 1
           }
           $bad = @()
           $libRoot = Join-Path $dist "bin\hipblaslt\library"
