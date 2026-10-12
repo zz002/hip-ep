@@ -329,7 +329,7 @@ jobs:
           $b = Join-Path $env:SB_BUILD "llvm"
           $prefix = Get-PrefixPath
           $sdk = Convert-Fwd $env:SB_SDK
-          $dist = "clang;clang-resource-headers;lld;llvm-objcopy;clang-offload-bundler;offload-arch;llvm-ar;llvm-link;opt;cmake-exports;clang-cmake-exports;lld-cmake-exports;llvm-libraries;clang-libraries;lld-libraries"
+          $dist = "clang;clang-resource-headers;lld;llvm-objcopy;clang-offload-bundler;clang-linker-wrapper;llvm-offload-binary;offload-arch;llvm-ar;llvm-link;opt;cmake-exports;clang-cmake-exports;lld-cmake-exports;llvm-libraries;clang-libraries;lld-libraries"
           $common = @(
             "-G", "Ninja",
             "-S", $src,
@@ -648,6 +648,9 @@ jobs:
             "bin\clang.exe",
             "bin\lld.exe",
             "bin\clang-offload-bundler.exe",
+            "bin\clang-linker-wrapper.exe",
+            "bin\llvm-offload-binary.exe",
+            "bin\ld.lld.exe",
             "bin\amdgpu-arch.exe",
             "amdgcn\bitcode",
             "lib\clang",
@@ -676,8 +679,9 @@ jobs:
           }
 
           $keepExe = @(
-            "clang.exe", "clang++.exe", "lld.exe", "lld-link.exe",
-            "llvm-objcopy.exe", "clang-offload-bundler.exe", "amdgpu-arch.exe"
+            "clang.exe", "clang++.exe", "lld.exe", "lld-link.exe", "ld.lld.exe",
+            "llvm-objcopy.exe", "clang-offload-bundler.exe", "clang-linker-wrapper.exe",
+            "llvm-offload-binary.exe", "amdgpu-arch.exe"
           )
           Get-ChildItem (Join-Path $dist "bin") -File -ErrorAction SilentlyContinue |
             Where-Object {
