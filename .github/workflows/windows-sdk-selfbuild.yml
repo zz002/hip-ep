@@ -33,9 +33,9 @@ env:
   MSGPACK_SHA256: 7504b7af7e7b9002ce529d4f941e1b7fb1fb435768780ce7da4abaac79bb156f
   # Tarball name follows cmake/deps.txt: <what>-dist-windows-<archs>-<version>-<variant>.
   # The version comes from the HIP source tree, these two describe this build.
-  DIST_ARCH_TAG: gfx115x-gfx1170
-  DIST_VARIANT: hipblaslt-gfx1170-trimmed
-  GPU_ARCHS: gfx1150;gfx1151;gfx1152;gfx1153;gfx1170
+  DIST_ARCH_TAG: gfx115x-gfx117x
+  DIST_VARIANT: hipblaslt-gfx117x-trimmed
+  GPU_ARCHS: gfx1150;gfx1151;gfx1152;gfx1153;gfx1170;gfx1171
 
 jobs:
   selfbuild:
@@ -559,14 +559,14 @@ jobs:
           )
           $copied = 0
           # gfx115x ships its full logic set (both Equality and GridBased); only
-          # gfx1170 is trimmed to the stems the workloads dispatch.
+          # gfx1170 and gfx1171 are trimmed to the stems the workloads dispatch.
           New-Item -ItemType Directory -Force -Path $keepAsm | Out-Null
           foreach ($arch in @("gfx1150", "gfx1151", "gfx1152", "gfx1153")) {
             $to = Join-Path $keepAsm $arch
             Copy-Item -Recurse (Join-Path $logicSrc $arch) $to
             $copied += @(Get-ChildItem $to -Recurse -Filter *.yaml).Count
           }
-          foreach ($arch in @("gfx1170")) {
+          foreach ($arch in @("gfx1170", "gfx1171")) {
             $from = Join-Path (Join-Path $logicSrc $arch) "GridBased"
             $to = Join-Path (Join-Path $keepAsm $arch) "GridBased"
             New-Item -ItemType Directory -Force -Path $to | Out-Null
@@ -657,6 +657,7 @@ jobs:
             "include\amd_comgr\amd_comgr.h",
             "bin\hipblaslt.dll",
             "bin\hipblaslt\library\gfx1151",
+            "bin\hipblaslt\library\gfx1171",
             "lib\cmake\hip\hip-config.cmake",
             "lib\cmake\hipblaslt"
           )
@@ -725,10 +726,10 @@ jobs:
           foreach ($d in Get-ChildItem $libRoot -Directory -ErrorAction SilentlyContinue) {
             $co = @(Get-ChildItem $d.FullName -Filter "*.co" -ErrorAction SilentlyContinue).Count
             Write-Host "hipBLASLt logic: $($d.Name) ($co .co)"
-            # gfx1170 is the only trimmed arch, so each side is checked against
-            # the opposite failure: a trim that silently went full, or a full set
-            # that silently got trimmed.
-            if ($d.Name -eq "gfx1170") {
+            # gfx1170 and gfx1171 are the trimmed archs, so each side is checked
+            # against the opposite failure: a trim that silently went full, or a
+            # full set that silently got trimmed.
+            if ($d.Name -in @("gfx1170", "gfx1171")) {
               if ($co -gt 20) { $bad += "$($d.Name): expected the trimmed set, got $co .co" }
             } elseif ($co -le 20) {
               $bad += "$($d.Name): expected the full set, got only $co .co"
