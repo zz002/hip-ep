@@ -34,7 +34,7 @@ env:
   # Tarball name follows cmake/deps.txt: <what>-dist-windows-<archs>-<version>-<variant>.
   # The version comes from the HIP source tree, these two describe this build.
   DIST_ARCH_TAG: gfx115x-gfx117x
-  DIST_VARIANT: hipblaslt-full
+  DIST_VARIANT: hipblaslt-gfx117x-no-fp8
   GPU_ARCHS: gfx1150;gfx1151;gfx1152;gfx1153;gfx1170;gfx1171
 
 jobs:
@@ -556,6 +556,12 @@ jobs:
           foreach ($arch in @("gfx1150", "gfx1151", "gfx1152", "gfx1153", "gfx1170", "gfx1171")) {
             $to = Join-Path $keepAsm $arch
             Copy-Item -Recurse (Join-Path $logicSrc $arch) $to
+            if ($arch -like "gfx117*") {
+              # FP8/BF8 logic files have a type code starting with F8 or B8 right after Cijk_<A>_<B>_.
+              Get-ChildItem $to -Recurse -Filter *.yaml |
+                Where-Object { $_.Name -match '^gfx117\d_Cijk_A\w{3}_B\w{3}_(F8|B8)' } |
+                Remove-Item
+            }
             $copied += @(Get-ChildItem $to -Recurse -Filter *.yaml).Count
           }
           Write-Host "copied $copied keep-set yaml files"
@@ -711,6 +717,11 @@ jobs:
             Write-Host "hipBLASLt logic: $($d.Name) ($co .co)"
             if ($co -le 20) {
               $bad += "$($d.Name): expected the full set, got only $co .co"
+            }
+            if ($d.Name -like "gfx117*") {
+              $fp8 = @(Get-ChildItem $d.FullName -Filter "TensileLibrary_*.co" |
+                Where-Object { $_.Name -match '^TensileLibrary_(F8|B8)' }).Count
+              if ($fp8 -gt 0) { $bad += "$($d.Name): expected no FP8/BF8 kernels, got $fp8 .co" }
             }
           }
           if ($bad.Count -gt 0) {
