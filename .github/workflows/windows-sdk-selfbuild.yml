@@ -33,9 +33,9 @@ env:
   MSGPACK_SHA256: 7504b7af7e7b9002ce529d4f941e1b7fb1fb435768780ce7da4abaac79bb156f
   # Tarball name follows cmake/deps.txt: <what>-dist-windows-<archs>-<version>-<variant>.
   # The version comes from the HIP source tree, these two describe this build.
-  DIST_ARCH_TAG: gfx115x-gfx117x
+  DIST_ARCH_TAG: gfx1103-gfx115x-gfx117x
   DIST_VARIANT: hipblaslt-gfx117x-trimmed
-  GPU_ARCHS: gfx1150;gfx1151;gfx1152;gfx1153;gfx1170;gfx1171
+  GPU_ARCHS: gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1170;gfx1171
 
 jobs:
   selfbuild:
@@ -562,10 +562,11 @@ jobs:
             "Cijk_Alik_Bljk_HSS_BH_Bias_SHB_HA_S_SAB_SCD_SAV_UserArgs"
           )
           $copied = 0
-          # gfx115x ships its full logic set (both Equality and GridBased); only
-          # gfx1170 and gfx1171 are trimmed to the stems the workloads dispatch.
+          # gfx1103 and gfx115x ship their full logic sets (both Equality and
+          # GridBased); only gfx1170 and gfx1171 are trimmed to the stems the
+          # workloads dispatch.
           New-Item -ItemType Directory -Force -Path $keepAsm | Out-Null
-          foreach ($arch in @("gfx1150", "gfx1151", "gfx1152", "gfx1153")) {
+          foreach ($arch in @("gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153")) {
             $to = Join-Path $keepAsm $arch
             Copy-Item -Recurse (Join-Path $logicSrc $arch) $to
             $copied += @(Get-ChildItem $to -Recurse -Filter *.yaml).Count
@@ -661,6 +662,7 @@ jobs:
             "lib\clang",
             "include\amd_comgr\amd_comgr.h",
             "bin\hipblaslt.dll",
+            "bin\hipblaslt\library\gfx1103",
             "bin\hipblaslt\library\gfx1151",
             "bin\hipblaslt\library\gfx1171",
             "lib\cmake\hip\hip-config.cmake",
